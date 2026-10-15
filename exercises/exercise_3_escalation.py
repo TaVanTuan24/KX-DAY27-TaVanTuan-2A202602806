@@ -1,211 +1,111 @@
 """Exercise 3 — Escalation branch with reviewer Q&A.
 
-When confidence < 60%, the agent doesn't ask approve/reject — it asks specific
-clarifying questions and then synthesizes a refined review from the answers.
+When confidence < 0.58 the agent must not ask "approve / reject". It asks the
+reviewer *specific* questions grounded in the diff, collects the answers, then
+re-runs the analysis with those answers to produce a **refined** review:
+
+    route ── escalate ──► synthesize ──► commit ──► END
+
+* ``node_analyze``'s prompt (``common/prompts.py``) requires 2–4 concrete
+  escalation questions naming the file/function at risk whenever confidence is
+  below the auto-approve threshold.
+* ``node_escalate`` calls ``interrupt({"kind": "escalation", ...})`` and stores
+  the answers in ``escalation_answers``.
+* ``node_synthesize`` re-prompts the model with the diff + original findings +
+  the reviewer's answers, keeps any risk the reviewer did not actually resolve,
+  and refuses to inflate confidence without a concrete reason (unresolved
+  ``blocker`` findings are re-instated even if the model drops them).
+
+Exercise 3 posts the refined review immediately after synthesis (the README's
+minimum flow). Exercise 4 adds the mandatory final confirmation before posting.
+
+Run:
+    uv run python exercises/exercise_3_escalation.py --pr <PR URL> [--dry-run]
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import uuid
 
 from dotenv import load_dotenv
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command, interrupt
-from rich.console import Console
-from rich.panel import Panel
+from langgraph.types import Command
 
-from common.github import fetch_pr, post_review_comment
-from common.llm import get_llm
-from common.schemas import (
-    AUTO_APPROVE_THRESHOLD,
-    ESCALATE_THRESHOLD,
-    PRAnalysis,
-    ReviewState,
-)
+from common.github import GitHubError, is_valid_pr_url
+from exercises.agent import Mode, build_graph, config_for, console
+from exercises.cli import handle_interrupt
 
 
-console = Console()
-
-
-def node_fetch_pr(state):
-    console.print("[cyan]→ fetch_pr[/cyan]")
-    with console.status("[dim]Fetching PR from GitHub...[/dim]"):
-        pr = fetch_pr(state["pr_url"])
-    console.print(f"  [green]✓[/green] {len(pr.files_changed)} files, head {pr.head_sha[:7]}")
-    return {"pr_title": pr.title, "pr_diff": pr.diff, "pr_files": pr.files_changed, "pr_head_sha": pr.head_sha}
-
-
-def node_analyze(state):
-    console.print("[cyan]→ analyze[/cyan]")
-    llm = get_llm().with_structured_output(PRAnalysis)
-    with console.status("[dim]LLM reviewing the diff...[/dim]"):
-        analysis = llm.invoke([
-            {"role": "system", "content": (
-                "Senior reviewer. Structured output. "
-                # TODO: add an instruction: if confidence < 60%, populate escalation_questions
-                # with 2–4 specific, context-rich questions (reference which file/section in the diff).
-            )},
-            {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
-        ])
-    console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.escalation_questions)} question(s)")
-    return {"analysis": analysis}
-
-
-def node_route(state):
-    console.print("[cyan]→ route[/cyan]")
-    c = state["analysis"].confidence
-    if c >= AUTO_APPROVE_THRESHOLD: decision = "auto_approve"
-    elif c < ESCALATE_THRESHOLD:    decision = "escalate"
-    else:                           decision = "human_approval"
-    console.print(f"  [green]✓[/green] decision=[bold]{decision}[/bold] (confidence={c:.0%})")
-    return {"decision": decision}
-
-
-def node_escalate(state: ReviewState) -> dict:
-    """Ask the reviewer specific questions; return their answers in state."""
-    a = state["analysis"]
-    questions = a.escalation_questions
-    if not questions:
-        # fallback when the LLM didn't generate any questions
-        questions = ["What is the intent of this PR?", "Any migration concerns?"]
-
-    # TODO: call interrupt(payload) where payload kind="escalation" contains:
-    #       pr_url, confidence, confidence_reasoning, summary, risk_factors, questions.
-    # answers = interrupt({...})
-    # return {"escalation_answers": answers}
-    raise NotImplementedError("Call interrupt() with an escalation payload")
-
-
-def node_synthesize(state: ReviewState) -> dict:
-    """Re-prompt LLM with the reviewer's answers and produce a refined review."""
-    # TODO:
-    #   - read state["escalation_answers"] (dict[question, answer])
-    #   - call get_llm().with_structured_output(PRAnalysis).invoke(...) with a prompt
-    #     containing the original diff + initial analysis + Q&A.
-    #   - return {"analysis": refined}
-    # `node_commit` will then post the refined review to the PR.
-    raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
-
-
-def node_human_approval(state):
-    a = state["analysis"]
-    response = interrupt({
-        "kind": "approval_request", "pr_url": state["pr_url"],
-        "confidence": a.confidence, "confidence_reasoning": a.confidence_reasoning,
-        "summary": a.summary,
-        "comments": [c.model_dump() for c in a.comments],
-        "diff_preview": state["pr_diff"][:2000],
-    })
-    return {"human_choice": response.get("choice"), "human_feedback": response.get("feedback")}
-
-
-def _render_comment_body(state) -> str:
-    a = state["analysis"]
-    lines = [f"### Automated review (confidence {a.confidence:.0%})", "", a.summary, ""]
-    for c in a.comments:
-        lines.append(f"- **[{c.severity}]** `{c.file}:{c.line or '?'}` — {c.body}")
-    if state.get("human_feedback"):
-        lines.append(f"\n_Reviewer note: {state['human_feedback']}_")
-    if state.get("escalation_answers"):
-        lines.append("\n_Reviewer answered escalation questions:_")
-        for q, ans in state["escalation_answers"].items():
-            lines.append(f"> **{q}** {ans}")
-    return "\n".join(lines)
-
-
-def _post(state, label: str) -> str:
-    try:
-        post_review_comment(state["pr_url"], _render_comment_body(state))
-        console.print(f"  [green]✓[/green] posted comment to {state['pr_url']}")
-        return label
-    except Exception as e:
-        console.print(f"  [red]✗[/red] post failed: {e}")
-        return "commit_failed"
-
-
-def node_commit(state):
-    console.print("[cyan]→ commit[/cyan]")
-    # Two paths converge here:
-    #   1. human_approval → commit (only post if approved)
-    #   2. escalate → synthesize → commit (always post the refined review)
-    if state.get("escalation_answers"):
-        return {"final_action": _post(state, "committed_after_escalation")}
-    if state.get("human_choice") == "approve":
-        return {"final_action": _post(state, "committed")}
-    console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
-    return {"final_action": "rejected"}
-
-
-def node_auto_approve(state):
-    console.print("[cyan]→ auto_approve[/cyan]  [dim]high confidence — posting directly[/dim]")
-    return {"final_action": _post(state, "auto_approved")}
-
-
-def build_graph():
-    g = StateGraph(ReviewState)
-    for name, fn in [
-        ("fetch_pr", node_fetch_pr), ("analyze", node_analyze), ("route", node_route),
-        ("auto_approve", node_auto_approve), ("human_approval", node_human_approval),
-        ("commit", node_commit), ("escalate", node_escalate), ("synthesize", node_synthesize),
-    ]:
-        g.add_node(name, fn)
-    g.add_edge(START, "fetch_pr")
-    g.add_edge("fetch_pr", "analyze")
-    g.add_edge("analyze", "route")
-    g.add_conditional_edges(
-        "route", lambda s: s["decision"],
-        {"auto_approve": "auto_approve", "human_approval": "human_approval", "escalate": "escalate"},
+async def run(pr_url: str, thread_id: str, *, dry_run: bool = False) -> dict:
+    app = build_graph(
+        mode=Mode.EXERCISE_3, checkpointer=MemorySaver(), dry_run=dry_run
     )
-    g.add_edge("auto_approve", END)
-    g.add_edge("human_approval", "commit")
-    g.add_edge("commit", END)
-    # TODO: wire escalate → synthesize → commit  (commit already → END)
-    return g.compile(checkpointer=MemorySaver())
+    cfg = config_for(thread_id)
+
+    result = await app.ainvoke({"pr_url": pr_url, "thread_id": thread_id}, cfg)
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        result = await app.ainvoke(Command(resume=handle_interrupt(payload)), cfg)
+    return result
 
 
-def handle_interrupt(payload):
-    kind = payload["kind"]
-    if kind == "approval_request":
-        console.print(Panel.fit(
-            payload["summary"],
-            title=f"Approve? conf={payload['confidence']:.0%}",
-            border_style="green",
-        ))
-        choice = console.input("approve/reject/edit? ").strip().lower()
-        return {"choice": choice, "feedback": console.input("Feedback: ").strip()}
-    if kind == "escalation":
-        console.print(Panel.fit(
-            payload["summary"],
-            title=f"Escalation conf={payload['confidence']:.0%}",
-            border_style="yellow",
-        ))
-        return {q: console.input(f"Q: {q}\nA: ").strip() for q in payload["questions"]}
-    raise ValueError(kind)
-
-
-def main():
+def main() -> None:
     load_dotenv()
-    p = argparse.ArgumentParser(); p.add_argument("--pr", required=True)
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pr", required=True, help="GitHub PR URL")
+    parser.add_argument("--thread", help="Reuse an existing thread_id")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Never POST to GitHub — prints what would be posted instead",
+    )
+    args = parser.parse_args()
+
+    if not is_valid_pr_url(args.pr):
+        console.print(f"[red]✗ Not a GitHub PR URL:[/red] {args.pr}")
+        raise SystemExit(2)
 
     console.rule("[bold]Exercise 3 — escalation with reviewer Q&A[/bold]")
     console.print(f"[dim]PR: {args.pr}[/dim]\n")
 
-    app = build_graph()
-    thread_id = str(uuid.uuid4())
-    cfg = {"configurable": {"thread_id": thread_id}}
-    console.print(f"[dim]thread_id = {thread_id}[/dim]\n")
+    thread_id = args.thread or str(uuid.uuid4())
+    console.print(f"[dim]thread_id = {thread_id}[/dim]")
+    if args.dry_run:
+        console.print("[yellow]dry-run: no comment will be posted to GitHub[/yellow]")
+    console.print()
 
-    result = app.invoke({"pr_url": args.pr, "thread_id": thread_id}, cfg)
-    while "__interrupt__" in result:
-        result = app.invoke(Command(resume=handle_interrupt(result["__interrupt__"][0].value)), cfg)
+    try:
+        result = asyncio.run(run(args.pr, thread_id, dry_run=args.dry_run))
+    except GitHubError as exc:
+        console.print(f"[red]✗ GitHub error:[/red] {exc.friendly}")
+        raise SystemExit(1) from exc
+    except KeyboardInterrupt:
+        console.print(f"\n[yellow]Interrupted.[/yellow] thread_id = {thread_id}")
+        raise SystemExit(130)
 
     console.rule("Final")
+    console.print(f"decision     = {result.get('decision')}")
     console.print(f"final_action = {result.get('final_action')}")
+    if result.get("fetch_error") or result.get("analysis_error"):
+        console.print(
+            f"[red]error[/red]        = {result.get('fetch_error') or result.get('analysis_error')}"
+        )
+        console.print("[red]Nothing was posted to GitHub.[/red]")
+        raise SystemExit(1)
+    if result.get("post_error"):
+        console.print(f"[red]error[/red]        = {result['post_error']}")
+        raise SystemExit(1)
     if "analysis" in result:
         console.print(f"final confidence = {result['analysis'].confidence:.0%}")
+        console.print(
+            f"unresolved risk factors = {len(result['analysis'].risk_factors)}"
+        )
+    if result.get("escalation_answers"):
+        console.print("[dim]reviewer answers recorded:[/dim]")
+        for q, a in result["escalation_answers"].items():
+            console.print(f"  [dim]• {q}[/dim] → {a or '(no answer)'}")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,12 @@
 --
 --   SELECT AVG(confidence) FROM audit_events WHERE decision = 'approve';
 --   SELECT * FROM audit_events WHERE risk_level = 'high' AND decision = 'auto';
+--
+-- `status` is the lifecycle phase of the event (pending / waiting / responded /
+-- done / failed) and, together with thread_id + action, forms the UNIQUE
+-- idempotency key: LangGraph re-executes a node from the top after an
+-- interrupt() resumes, and INSERT OR IGNORE on this key keeps the trail free of
+-- duplicate rows.
 
 CREATE TABLE IF NOT EXISTS audit_events (
     id                INTEGER  PRIMARY KEY AUTOINCREMENT,
@@ -26,6 +32,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
     risk_level        TEXT     NOT NULL CHECK (risk_level IN ('low', 'med', 'high')),
     reviewer_id       TEXT,
     decision          TEXT     NOT NULL,
+    status            TEXT     NOT NULL DEFAULT 'pending',
     reason            TEXT,
     execution_time_ms INTEGER  NOT NULL CHECK (execution_time_ms >= 0)
 );
@@ -34,3 +41,8 @@ CREATE INDEX IF NOT EXISTS audit_events_thread_idx   ON audit_events (thread_id,
 CREATE INDEX IF NOT EXISTS audit_events_pr_idx       ON audit_events (pr_url, timestamp DESC);
 CREATE INDEX IF NOT EXISTS audit_events_decision_idx ON audit_events (decision);
 CREATE INDEX IF NOT EXISTS audit_events_risk_idx     ON audit_events (risk_level);
+
+-- Idempotency key. Also created by common/db.py:_ensure_idempotency_index for
+-- databases that were created before this column existed.
+CREATE UNIQUE INDEX IF NOT EXISTS audit_events_idempotency_idx
+    ON audit_events (thread_id, action, status, decision);

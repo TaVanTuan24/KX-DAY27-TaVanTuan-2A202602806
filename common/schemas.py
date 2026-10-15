@@ -1,5 +1,5 @@
 """Shared types: the graph state, the LLM's structured analysis output,
-and the structured audit-trail entry written to PostgreSQL."""
+and the structured audit-trail entry written to the ``audit_events`` table."""
 
 from __future__ import annotations
 
@@ -11,6 +11,39 @@ from pydantic import BaseModel, Field
 
 Decision = Literal["auto_approve", "human_approval", "escalate"]
 HumanChoice = Literal["approve", "reject", "edit"]
+
+#: Actions accepted by ``audit_events.action`` — one per meaningful graph event.
+AuditAction = Literal[
+    "fetch_pr",
+    "analyze",
+    "route",
+    "auto_approve",
+    "human_approval",
+    "escalate",
+    "synthesize",
+    "final_approval",
+    "commit",
+]
+
+#: Decisions accepted by ``audit_events.decision``.
+AuditDecision = Literal[
+    "auto", "approve", "reject", "edit", "escalate", "pending", "committed", "failed",
+]
+
+#: Lifecycle phase accepted by ``audit_events.status``.
+AuditStatus = Literal[
+    "pending",     # an automated step that has no outcome of its own
+    "waiting",     # written just before an interrupt(): the human has not answered
+    "responded",   # written just after resume: the human's answer is known
+    "done",        # the step produced its final outcome
+    "failed",      # the step failed (GitHub API error, ...)
+]
+
+#: Severities that force human review even when the model is very confident.
+BLOCKING_SEVERITIES = frozenset({"blocker"})
+#: Ordering of finding severities, worst last — used to sort/report findings
+#: without relying on string comparison.
+SEVERITY_RANK = {"nit": 0, "suggestion": 1, "issue": 2, "blocker": 3}
 
 
 # Confidence thresholds
@@ -29,6 +62,64 @@ def risk_level_for(confidence: float) -> str:
     if confidence < ESCALATE_THRESHOLD:
         return "high"
     return "med"
+
+
+def _looks_security_related(text: str) -> bool:
+    """Cheap keyword heuristic for "this risk factor is security-relevant"."""
+    lowered = text.lower()
+    return any(
+        kw in lowered
+        for kw in (
+            "secur", "auth", "password", "credential", "secret", "token",
+            "inject", "xss", "csrf", "ssrf", "sql", "crypto", "hash", "md5",
+            "sha1", "tls", "ssl", "permission", "privilege", "sanitiz",
+            "vulnerab", "exploit", "pii", "leak",
+        )
+    )
+
+
+def has_blocking_risk(analysis: "PRAnalysis") -> bool:
+    """True when the analysis contains a security issue or blocker.
+
+    Such PRs always require a human, whatever the self-reported confidence
+    (lab requirement §9.2: "với lỗi bảo mật nghiêm trọng hoặc blocker, bắt
+    buộc yêu cầu người duyệt trước khi đăng, kể cả confidence cao").
+    """
+    if any(c.severity in BLOCKING_SEVERITIES for c in analysis.comments):
+        return True
+    return any(_looks_security_related(rf) for rf in analysis.risk_factors)
+
+
+def route_for(analysis: "PRAnalysis") -> Decision:
+    """Single source of truth for confidence-based routing.
+
+    Boundaries (inclusive on the lower edge of each band):
+
+    * ``confidence >= AUTO_APPROVE_THRESHOLD`` → ``auto_approve``
+    * ``ESCALATE_THRESHOLD <= confidence < AUTO_APPROVE_THRESHOLD`` → ``human_approval``
+    * ``confidence < ESCALATE_THRESHOLD`` → ``escalate``
+
+    Overridden to ``human_approval`` when the analysis carries a security /
+    blocker risk (see :func:`has_blocking_risk`).
+    """
+    confidence = analysis.confidence
+    if confidence < ESCALATE_THRESHOLD:
+        return "escalate"
+    if confidence >= AUTO_APPROVE_THRESHOLD and not has_blocking_risk(analysis):
+        return "auto_approve"
+    return "human_approval"
+
+
+def audit_risk_level(analysis: "PRAnalysis") -> str:
+    """risk_level for an ``AuditEntry`` built from an analysis.
+
+    A security/blocker finding is ``high`` risk regardless of confidence — the
+    audit trail must not report ``risk_level='low' AND decision='auto'`` for a
+    PR that only escaped auto-approval because of a security finding.
+    """
+    if has_blocking_risk(analysis):
+        return "high"
+    return risk_level_for(analysis.confidence)
 
 
 class ReviewComment(BaseModel):
@@ -96,7 +187,16 @@ class AuditEntry(BaseModel):
     )
     decision: str = Field(
         description="Outcome at this step — "
-                    "'auto' | 'approve' | 'reject' | 'edit' | 'escalate' | 'pending'.",
+                    "'auto' | 'approve' | 'reject' | 'edit' | 'escalate' | "
+                    "'pending' | 'committed' | 'failed'.",
+    )
+    status: str = Field(
+        default="pending",
+        description="Lifecycle phase of this event — "
+                    "'pending' | 'waiting' | 'responded' | 'done' | 'failed'. "
+                    "Together with (thread_id, action) it forms the UNIQUE "
+                    "idempotency key that keeps re-executed nodes from writing "
+                    "duplicate audit rows.",
     )
     reason: str | None = Field(
         default=None,
@@ -119,6 +219,7 @@ class ReviewState(TypedDict, total=False):
     # Populated by fetch_pr
     pr_title: str
     pr_author: str
+    pr_description: str
     pr_diff: str
     pr_files: list[str]
     pr_head_sha: str
@@ -133,7 +234,17 @@ class ReviewState(TypedDict, total=False):
     human_choice: HumanChoice | None
     human_feedback: str | None
     escalation_answers: dict[str, str] | None
+    reviewer_id: str | None
+
+    # Populated by final_approval (post-escalation confirmation)
+    refine_confirmed: bool | None
 
     # Populated by commit / final nodes
     posted_comment_body: str | None
     final_action: str | None
+
+    # Error channels — used by the failure nodes (nothing is posted when set)
+    fetch_error: str | None
+    analysis_error: str | None
+    post_error: str | None
+    refined: bool | None

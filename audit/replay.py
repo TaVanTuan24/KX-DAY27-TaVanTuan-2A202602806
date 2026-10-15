@@ -7,6 +7,10 @@ Usage:
 The script reads `audit_events` (human-readable timeline). The LangGraph
 SqliteSaver checkpoint tables live in the same .db file but are queried
 separately by the LangGraph runtime, not by this tool.
+
+Risk ordering is explicit: the "worst risk" of a thread is `high > med > low`,
+computed with a CASE expression rather than `MAX(risk_level)` over TEXT (which
+would order alphabetically: "med" > "low" > "high" — i.e. wrong).
 """
 
 from __future__ import annotations
@@ -17,48 +21,51 @@ import asyncio
 from rich.console import Console
 from rich.table import Table
 
-from common.db import db_conn, replay_events
-
+from common.db import list_threads as _list_threads_data
+from common.db import replay_events
+from common.prompts import force_utf8_stdio
 
 RISK_COLOR = {"low": "green", "med": "yellow", "high": "red"}
+STATUS_COLOR = {
+    "pending": "white",
+    "waiting": "yellow",
+    "responded": "cyan",
+    "done": "green",
+    "failed": "red",
+}
+
+force_utf8_stdio()
+console = Console()
 
 
 async def list_threads() -> None:
-    console = Console()
-    async with db_conn() as conn:
-        async with conn.execute(
-            """
-            SELECT thread_id,
-                   pr_url,
-                   MIN(timestamp)        AS started,
-                   MAX(timestamp)        AS last_event,
-                   MAX(risk_level)       AS worst_risk,
-                   COUNT(*)              AS events
-              FROM audit_events
-             GROUP BY thread_id, pr_url
-             ORDER BY MAX(timestamp) DESC
-             LIMIT 25
-            """
-        ) as cur:
-            rows = await cur.fetchall()
+    """Print a table of recent review sessions (CLI view)."""
+    rows = await _list_threads_data()
 
     table = Table(title="Recent review sessions")
-    for col in ("thread_id", "pr_url", "started", "last_event", "worst_risk", "events"):
+    for col in (
+        "thread_id", "pr_url", "started", "last_event",
+        "worst_risk", "events", "state",
+    ):
         table.add_column(col)
     for r in rows:
+        risk = str(r["worst_risk"] or "?")
         table.add_row(
             r["thread_id"],
             r["pr_url"],
             str(r["started"]),
             str(r["last_event"]),
-            str(r["worst_risk"]),
+            f"[{RISK_COLOR.get(risk, 'white')}]{risk}[/]",
             str(r["events"]),
+            f"{r['last_action']}/{r['last_decision']}",
         )
+    if not rows:
+        console.print("[yellow]No audit events yet — run an exercise first.[/yellow]")
+        return
     console.print(table)
 
 
 async def replay(thread_id: str) -> None:
-    console = Console()
     events = await replay_events(thread_id)
 
     if not events:
@@ -69,18 +76,22 @@ async def replay(thread_id: str) -> None:
     for ev in events:
         risk = ev["risk_level"]
         risk_colored = f"[{RISK_COLOR.get(risk, 'white')}]{risk:<4}[/]"
+        status = ev.get("status") or "?"
+        status_colored = f"[{STATUS_COLOR.get(status, 'white')}]{status:<9}[/]"
         reviewer = ev["reviewer_id"] or "-"
         reason = (ev["reason"] or "")[:60]
         console.print(
             f"[dim]{ev['timestamp']}[/dim]  "
-            f"[cyan]{ev['action']:<18}[/cyan] "
+            f"[cyan]{ev['action']:<15}[/cyan] "
             f"conf=[bold]{ev['confidence']:.2f}[/bold] "
             f"risk={risk_colored} "
             f"decision=[magenta]{ev['decision']:<10}[/magenta] "
+            f"status={status_colored} "
             f"reviewer={reviewer:<14} "
             f"{ev['execution_time_ms']:>5}ms  "
             f"[dim]{reason}[/dim]"
         )
+    console.print(f"\n[dim]{len(events)} event(s)[/dim]")
 
 
 def main() -> None:
