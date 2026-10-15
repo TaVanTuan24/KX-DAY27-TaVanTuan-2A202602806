@@ -100,6 +100,96 @@ def test_low_confidence_escalates_even_with_a_blocker() -> None:
     assert route_for(analysis) == "escalate"
 
 
+# ─── security heuristic calibration (found on a live run of PR-Demo #1) ────
+#
+# PR #1 is a mechanical schema change whose risk factors mention
+# `sqlite3.OperationalError` and "no injection surface". The first version of the
+# heuristic matched the *substring* "sql" inside "sqlite3" (and would have matched
+# "auth" inside "author"), marking a safe PR `risk_level='high'` and printing a
+# bogus "(security/blocker override)" line. These cases pin the fix.
+
+@pytest.mark.parametrize(
+    "risk_factor",
+    [
+        # substring traps: sql ⊂ sqlite3, auth ⊂ author, token ⊂ tokenizer
+        "`sqlite3.OperationalError: no such column: priority` will be raised on old databases",
+        "The new `author` field is not validated",
+        "Renames the internal tokenizer helper",
+        "No automated tests accompany the new behaviour",
+        # a solved/denied concern is not a risk
+        "The SQL is fully parameterized, so there is no injection surface",
+        "Secrets are no longer written to the log",
+        "No MD5, no plaintext token storage, and no string concatenation in queries",
+        "plain HTTP is not reachable and the token is never logged",
+    ],
+)
+def test_benign_risk_factors_do_not_force_a_human(risk_factor: str) -> None:
+    analysis = make_analysis(0.97, risk_factors=[risk_factor])
+    assert has_blocking_risk(analysis) is False, risk_factor
+    assert route_for(analysis) == "auto_approve"
+    assert audit_risk_level(analysis) == "low"
+
+
+@pytest.mark.parametrize(
+    "risk_factor",
+    [
+        "SQL injection in Storage.add",
+        "MD5 password hashing is cryptographically broken",
+        "The sync token is stored in plaintext",
+        "SYNC_URL is plain HTTP and the upload is unauthenticated",
+        "No tests were added; SQL injection is still possible in Storage.add",
+        "Missing authorization check on the admin route",
+        "Weak hash algorithm with no salting",
+    ],
+)
+def test_real_security_risk_factors_still_force_a_human(risk_factor: str) -> None:
+    analysis = make_analysis(0.97, risk_factors=[risk_factor])
+    assert has_blocking_risk(analysis) is True, risk_factor
+    assert route_for(analysis) == "human_approval"
+    assert audit_risk_level(analysis) == "high"
+
+
+def test_the_override_only_ever_downgrades_auto_approve() -> None:
+    """Comparing route_for with the confidence-only route shows *why* it changed."""
+    from common.schemas import confidence_only_route
+
+    security = make_analysis(0.9, risk_factors=["SQL injection in Storage.add"])
+    assert confidence_only_route(security) == "auto_approve"
+    assert route_for(security) == "human_approval"  # ← actually overridden
+
+    plain = make_analysis(0.65)
+    assert confidence_only_route(plain) == "human_approval"
+    assert route_for(plain) == "human_approval"  # ← not an override
+
+    low = make_analysis(0.2, risk_factors=["SQL injection in Storage.add"])
+    assert confidence_only_route(low) == "escalate"
+    assert route_for(low) == "escalate"  # escalation wins over the override
+
+
+def test_the_heuristic_residual_bias_is_towards_asking_a_human() -> None:
+    """Document the two residual imprecisions — both in the safe direction.
+
+    A keyword heuristic cannot read intent, so:
+
+    * a security topic stated *positively* ("TLS is enforced") still counts, and
+    * "no <protection>" ("no sanitization of user input") reads as denied and is
+      therefore missed.
+
+    Neither can let a security PR auto-post unnoticed in practice, because the
+    model's own ``blocker`` severity is the primary signal and the prompts require
+    it for anything that must not ship.
+    """
+    positive = make_analysis(0.97, risk_factors=["TLS is enforced on the sync endpoint"])
+    assert has_blocking_risk(positive) is True  # safe direction: asks a human
+
+    missed = make_analysis(0.97, risk_factors=["There is no sanitization of user input"])
+    assert has_blocking_risk(missed) is False  # documented gap — see docstring
+
+    # ...the same finding phrased as a risk *is* caught:
+    caught = make_analysis(0.97, risk_factors=["User input reaches the query unsanitized"])
+    assert has_blocking_risk(caught) is True
+
+
 # ─── nodes ─────────────────────────────────────────────────────────────────
 
 

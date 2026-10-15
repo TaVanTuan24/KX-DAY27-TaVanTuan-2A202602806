@@ -3,6 +3,7 @@ and the structured audit-trail entry written to the ``audit_events`` table."""
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Literal, TypedDict
 
@@ -26,8 +27,10 @@ AuditAction = Literal[
 ]
 
 #: Decisions accepted by ``audit_events.decision``.
+#: ``dry_run`` exists so a rehearsal never claims a comment was posted.
 AuditDecision = Literal[
-    "auto", "approve", "reject", "edit", "escalate", "pending", "committed", "failed",
+    "auto", "approve", "reject", "edit", "escalate", "pending",
+    "committed", "failed", "dry_run",
 ]
 
 #: Lifecycle phase accepted by ``audit_events.status``.
@@ -65,17 +68,120 @@ def risk_level_for(confidence: float) -> str:
 
 
 def _looks_security_related(text: str) -> bool:
-    """Cheap keyword heuristic for "this risk factor is security-relevant"."""
-    lowered = text.lower()
-    return any(
-        kw in lowered
-        for kw in (
-            "secur", "auth", "password", "credential", "secret", "token",
-            "inject", "xss", "csrf", "ssrf", "sql", "crypto", "hash", "md5",
-            "sha1", "tls", "ssl", "permission", "privilege", "sanitiz",
-            "vulnerab", "exploit", "pii", "leak",
-        )
+    """Cheap, conservative heuristic for "this risk factor is security-relevant".
+
+    Used only as a *secondary* signal: the model's own ``blocker`` severity is the
+    primary one (the prompts tell it to use ``blocker`` for anything that must not
+    ship). This exists so a security risk factor that was not linked to a blocker
+    comment still forces a human.
+
+    Calibration matters — a false positive here mislabels an audit row as
+    ``risk_level='high'`` and blocks auto-approval for a safe PR:
+
+    * patterns are **word-boundary** anchored, so ``sqlite3`` does not match
+      ``sql`` and ``author`` does not match ``auth``;
+    * a match inside a negated clause ("… so there is no injection surface",
+      "SQL is fully parameterized") is ignored.
+    """
+    for pattern in SECURITY_PATTERNS:
+        for match in pattern.finditer(text):
+            before = _clause_before(text, match.start())
+            after = _clause_after(text, match.end())
+            if not (
+                _NEGATION_RE.search(before) or _TRAILING_NEGATION_RE.search(after)
+            ):
+                return True
+    return False
+
+
+#: Security-relevant phrases. Deliberately specific: bare ``sql``/``hash``/``auth``
+#: match database engines, `hashmap` and `author` respectively.
+SECURITY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\binjection\b",
+        r"\bsql\s+injection\b",
+        r"\braw\s+sql\b",
+        r"\bstring[\s-]concatenat",
+        r"\bunsaniti[sz]",
+        r"\bsaniti[sz]",
+        r"\bxss\b",
+        r"\bcsrf\b",
+        r"\bssrf\b",
+        r"\bpath\s+traversal\b",
+        r"\bauth\b",
+        r"\bauthenticat",
+        r"\bauthoriz",
+        r"\bpassword\b",
+        r"\bcredential",
+        r"\bsecret\b",
+        r"\bapi[\s_-]?key\b",
+        r"\btoken\b",
+        r"\bmd5\b",
+        r"\bsha[\s-]?1\b",
+        r"\bbcrypt\b",
+        r"\bargon2\b",
+        r"\bplain\s?text\b",
+        r"\bplain\s?http\b",
+        r"\bhttp://",
+        r"\btls\b",
+        r"\bssl\b",
+        r"\bpermission",
+        r"\bprivilege",
+        r"\bescalat",
+        r"\bvulnerab",
+        r"\bexploit",
+        r"\bcve-\d{4}",
+        r"\bpii\b",
+        r"\bleak",
+        r"\bexfiltrat",
+        r"\bcrypto",
+        r"\bweak\s+hash",
     )
+)
+
+#: Cues that the surrounding clause *denies* the problem ("no injection",
+#: "fully parameterized", "properly escaped").
+_NEGATION_RE = re.compile(
+    r"\b(?:no|not|never|none|nothing|without|isn'?t|aren'?t|doesn'?t|don'?t|didn'?t|"
+    r"cannot|can'?t|won'?t|neither|nor|parameteri[sz]ed|escaped|safely|"
+    r"saniti[sz]ed)\b",
+    re.IGNORECASE,
+)
+
+#: Negation that trails the keyword and binds to it ("plain HTTP **is not**
+#: reachable"). Deliberately much narrower than :data:`_NEGATION_RE`: a bare "no"
+#: in the following clause usually belongs to a *different* phrase
+#: ("Weak hash algorithm with no salting" is a real finding), so only a
+#: copula/auxiliary immediately followed by a negative counts here.
+_TRAILING_NEGATION_RE = re.compile(
+    r"^\s*(?:(?:is|are|was|were|has|have|had|will|would|can|cannot|must|should|"
+    r"does|do|did)\s+(?:not|never|no\s+longer)\b"
+    r"|isn'?t|aren'?t|wasn'?t|weren'?t|doesn'?t|don'?t|didn'?t|never|no\s+longer)\b",
+    re.IGNORECASE,
+)
+
+#: Clause boundaries used to scope a negation cue to the match it belongs to.
+_CLAUSE_SPLIT_RE = re.compile(r"[.;:,!?]\s+|\n")
+
+
+def _clause_before(text: str, index: int, limit: int = 90) -> str:
+    """The clause immediately preceding ``index`` (so negation stays local)."""
+    window = text[max(0, index - limit) : index]
+    segments = _CLAUSE_SPLIT_RE.split(window)
+    return segments[-1] if segments else window
+
+
+def _clause_after(text: str, index: int, limit: int = 60) -> str:
+    """The clause immediately following ``index``.
+
+    Negation can trail the keyword ("plain HTTP **is not** reachable"), so both
+    directions are checked — each bounded to its own clause, which keeps an
+    unrelated "no" elsewhere in the sentence from suppressing a real finding.
+    """
+    window = text[index : index + limit]
+    segments = _CLAUSE_SPLIT_RE.split(window, maxsplit=1)
+    return segments[0] if segments else window
 
 
 def has_blocking_risk(analysis: "PRAnalysis") -> bool:
@@ -106,6 +212,21 @@ def route_for(analysis: "PRAnalysis") -> Decision:
     if confidence < ESCALATE_THRESHOLD:
         return "escalate"
     if confidence >= AUTO_APPROVE_THRESHOLD and not has_blocking_risk(analysis):
+        return "auto_approve"
+    return "human_approval"
+
+
+def confidence_only_route(analysis: "PRAnalysis") -> Decision:
+    """Routing from confidence alone — i.e. without the security override.
+
+    Used to report *why* a PR was pulled down: comparing this with
+    :func:`route_for` shows whether a security finding (rather than confidence)
+    is what forced a human. The override can only ever move
+    ``auto_approve`` → ``human_approval``; ``escalate`` always wins.
+    """
+    if analysis.confidence < ESCALATE_THRESHOLD:
+        return "escalate"
+    if analysis.confidence >= AUTO_APPROVE_THRESHOLD:
         return "auto_approve"
     return "human_approval"
 

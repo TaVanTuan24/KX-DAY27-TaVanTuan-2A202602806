@@ -5,8 +5,9 @@ Turn the ``human_approval`` node from a placeholder into a real pause-and-ask:
 * ``node_human_approval`` calls ``interrupt(payload)`` with
   ``kind="approval_request"``, the confidence, the reasoning, the summary, the
   proposed comments and a diff preview.
-* The graph is compiled with ``checkpointer=MemorySaver()`` — mandatory, without
-  a checkpointer ``interrupt()`` raises instead of pausing.
+* The graph is compiled with an in-process ``MemorySaver``
+  (``common.db.memory_checkpointer()``) — mandatory: without a checkpointer
+  ``interrupt()`` raises instead of pausing.
 * ``main()`` loops while ``"__interrupt__" in result``, renders the payload and
   resumes with ``Command(resume=answer)`` **on the same thread_id**.
 
@@ -30,7 +31,7 @@ import asyncio
 import uuid
 
 from dotenv import load_dotenv
-from langgraph.checkpoint.memory import MemorySaver
+from common.db import memory_checkpointer
 from langgraph.types import Command
 
 from common.github import GitHubError, is_valid_pr_url
@@ -40,7 +41,7 @@ from exercises.cli import handle_interrupt
 
 async def run(pr_url: str, thread_id: str, *, dry_run: bool = False) -> dict:
     app = build_graph(
-        mode=Mode.EXERCISE_2, checkpointer=MemorySaver(), dry_run=dry_run
+        mode=Mode.EXERCISE_2, checkpointer=memory_checkpointer(), dry_run=dry_run
     )
     cfg = config_for(thread_id)
 

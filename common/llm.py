@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 from typing import Any, TypeVar
@@ -42,21 +43,34 @@ _UNSUPPORTED: set[str] = set()
 _UNSUPPORTED_LOCK = threading.Lock()
 
 
+def api_key() -> str:
+    """The LLM credential, from ``LLM_API_KEY`` or the legacy ``OPENROUTER_API_KEY``.
+
+    ``LLM_BASE_URL`` is configurable, so the credential is not necessarily an
+    OpenRouter key (a W&B Inference / vLLM / any OpenAI-compatible endpoint works
+    too). ``LLM_API_KEY`` is the honest name; ``OPENROUTER_API_KEY`` is kept
+    working because ``.env.example`` and the original skeleton used it.
+    """
+    for name in ("LLM_API_KEY", "OPENROUTER_API_KEY"):
+        value = os.environ.get(name)
+        if value:
+            return value
+    raise RuntimeError(
+        "No LLM credential found — set LLM_API_KEY (or OPENROUTER_API_KEY) in .env, "
+        "along with LLM_MODEL and LLM_BASE_URL."
+    )
+
+
 def get_llm(temperature: float = 0.2) -> ChatOpenAI:
     """Build the chat model from environment variables.
 
     ``max_retries`` is bounded so a transient provider error surfaces as an
     exception the nodes can turn into a friendly message instead of hanging.
     """
-    import os
-
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is not set — copy .env.example to .env")
     return ChatOpenAI(
         model=os.environ.get("LLM_MODEL", DEFAULT_MODEL),
         base_url=os.environ.get("LLM_BASE_URL", DEFAULT_BASE_URL),
-        api_key=api_key,
+        api_key=api_key(),
         temperature=temperature,
         max_retries=2,
     )
@@ -231,6 +245,7 @@ __all__ = [
     "DEFAULT_MODEL",
     "STRUCTURED_METHODS",
     "StructuredOutputLLM",
+    "api_key",
     "get_llm",
     "is_transient_llm_error",
     "reset_structured_output_cache",

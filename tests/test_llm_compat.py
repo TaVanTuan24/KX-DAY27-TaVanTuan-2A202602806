@@ -191,6 +191,38 @@ def test_the_model_name_is_read_from_env_not_hardcoded(monkeypatch: pytest.Monke
 
 
 def test_get_llm_without_a_key_fails_with_a_helpful_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Both names must be cleared: importing app.py runs load_dotenv(), so a real
+    # .env may already have leaked into os.environ for this process.
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY is not set"):
+    with pytest.raises(RuntimeError, match="LLM_API_KEY"):
         llm_module.get_llm()
+
+
+# ─── the credential name is provider-neutral ────────────────────────────────
+#
+# LLM_BASE_URL is configurable, so the credential is not necessarily an OpenRouter
+# key (this lab was also validated against a W&B Inference endpoint). LLM_API_KEY
+# is the honest name; the skeleton's OPENROUTER_API_KEY keeps working.
+
+
+def test_llm_api_key_works_on_a_non_openrouter_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_API_KEY", "wandb-secret")
+    monkeypatch.setenv("LLM_MODEL", "deepseek-ai/DeepSeek-V4.1-Flash")
+    monkeypatch.setenv("LLM_BASE_URL", "https://api.inference.wandb.ai/v1")
+    chat = llm_module.get_llm()
+    assert chat.model_name == "deepseek-ai/DeepSeek-V4.1-Flash"
+    assert chat.openai_api_key.get_secret_value() == "wandb-secret"
+
+
+def test_llm_api_key_takes_precedence_over_the_legacy_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_API_KEY", "preferred")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "legacy")
+    assert llm_module.api_key() == "preferred"
+
+
+def test_the_legacy_openrouter_api_key_is_still_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "legacy-still-fine")
+    assert llm_module.api_key() == "legacy-still-fine"

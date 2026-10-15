@@ -36,11 +36,11 @@ import time
 from enum import Enum
 from typing import Any, Callable, Protocol
 
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 from rich.console import Console
 
+from common.db import memory_checkpointer
 from common.github import (
     GitHubError,
     PullRequest,
@@ -55,6 +55,7 @@ from common.schemas import (
     PRAnalysis,
     ReviewState,
     audit_risk_level,
+    confidence_only_route as route_for_by_confidence_only,
     has_blocking_risk,
     risk_level_for,
     route_for,
@@ -695,7 +696,9 @@ class Agent:
                 action="commit",
                 confidence=analysis.confidence,
                 risk_level=audit_risk_level(analysis),
-                decision="committed",
+                # NOT "committed": nothing reached GitHub, and an auditor filtering
+                # on `decision` must not read this as a posted review.
+                decision="dry_run",
                 status="done",
                 reason=f"dry-run: {len(body)} chars would be posted",
                 execution_time_ms=self.clock.elapsed_ms(t0),
@@ -767,7 +770,7 @@ class Agent:
                 action="auto_approve",
                 confidence=analysis.confidence,
                 risk_level="low",
-                decision="auto",
+                decision="dry_run",  # not "auto": nothing reached GitHub
                 status="done",
                 reason=f"dry-run: {len(body)} chars would be posted",
                 execution_time_ms=self.clock.elapsed_ms(t0),
@@ -828,17 +831,6 @@ class Agent:
     async def node_analyze_failed(self, state: ReviewState) -> dict:
         console.print("[red]✗ aborting: analysis failed — nothing was posted[/red]")
         return {"final_action": "analyze_failed"}
-
-
-def route_for_by_confidence_only(analysis: PRAnalysis) -> str:
-    """Confidence-only routing, used to explain a security override in the log."""
-    from common.schemas import AUTO_APPROVE_THRESHOLD, ESCALATE_THRESHOLD
-
-    if analysis.confidence < ESCALATE_THRESHOLD:
-        return "escalate"
-    if analysis.confidence >= AUTO_APPROVE_THRESHOLD:
-        return "auto_approve"
-    return "human_approval"
 
 
 def _reinstate_blockers(refined: PRAnalysis, initial: PRAnalysis) -> PRAnalysis:
@@ -960,7 +952,7 @@ def build_graph(
     g.add_edge("escalate", "synthesize")
     if mode is Mode.EXERCISE_2:
         g.add_edge("synthesize", END)
-        return g.compile(checkpointer=checkpointer or MemorySaver())
+        return g.compile(checkpointer=checkpointer or memory_checkpointer())
 
     if mode.has_final_confirmation:
         g.add_node("final_approval", agent.node_final_approval)
@@ -975,7 +967,7 @@ def build_graph(
     else:
         g.add_edge("synthesize", "commit")
 
-    return g.compile(checkpointer=checkpointer or MemorySaver())
+    return g.compile(checkpointer=checkpointer or memory_checkpointer())
 
 
 def config_for(thread_id: str) -> dict:

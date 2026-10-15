@@ -9,7 +9,7 @@ inflate its confidence without an answer.
 from __future__ import annotations
 
 import pytest
-from langgraph.checkpoint.memory import MemorySaver
+from common.db import memory_checkpointer
 from langgraph.types import Command
 
 from common.schemas import ReviewComment
@@ -54,7 +54,7 @@ def escalation_setup():
     factory = FakeLLMFactory(initial, refined)
     gh = FakeGitHub()
     app = build_graph(
-        mode=Mode.EXERCISE_3, checkpointer=MemorySaver(), llm_factory=factory, github=gh
+        mode=Mode.EXERCISE_3, checkpointer=memory_checkpointer(), llm_factory=factory, github=gh
     )
     return app, factory, gh, initial, refined
 
@@ -117,7 +117,7 @@ async def test_confidence_is_not_inflated_without_answers() -> None:
     refined = make_analysis(0.95, summary="Looks fine now.", risk_factors=[], comments=[])
     app = build_graph(
         mode=Mode.EXERCISE_3,
-        checkpointer=MemorySaver(),
+        checkpointer=memory_checkpointer(),
         llm_factory=FakeLLMFactory(initial, refined),
         github=FakeGitHub(),
     )
@@ -144,7 +144,7 @@ async def test_synthesis_failure_keeps_the_session_alive_and_posts_nothing() -> 
     factory = FakeLLMFactory(initial, RuntimeError("provider down"))
     gh = FakeGitHub()
     app = build_graph(
-        mode=Mode.EXERCISE_3, checkpointer=MemorySaver(), llm_factory=factory, github=gh
+        mode=Mode.EXERCISE_3, checkpointer=memory_checkpointer(), llm_factory=factory, github=gh
     )
     await app.ainvoke({"pr_url": PR_URL, "thread_id": "esc"}, config_for("esc"))
     final = await app.ainvoke(Command(resume={"q1": "a", "q2": "b"}), config_for("esc"))
@@ -157,7 +157,7 @@ async def test_fallback_questions_exist_when_the_llm_returns_none() -> None:
     """A low-confidence analysis with no questions must still ask something specific."""
     app = build_graph(
         mode=Mode.EXERCISE_3,
-        checkpointer=MemorySaver(),
+        checkpointer=memory_checkpointer(),
         llm_factory=FakeLLMFactory(make_analysis(0.2, questions=[])),
         github=FakeGitHub(),
     )

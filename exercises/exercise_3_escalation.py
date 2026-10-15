@@ -30,7 +30,7 @@ import asyncio
 import uuid
 
 from dotenv import load_dotenv
-from langgraph.checkpoint.memory import MemorySaver
+from common.db import memory_checkpointer
 from langgraph.types import Command
 
 from common.github import GitHubError, is_valid_pr_url
@@ -40,7 +40,7 @@ from exercises.cli import handle_interrupt
 
 async def run(pr_url: str, thread_id: str, *, dry_run: bool = False) -> dict:
     app = build_graph(
-        mode=Mode.EXERCISE_3, checkpointer=MemorySaver(), dry_run=dry_run
+        mode=Mode.EXERCISE_3, checkpointer=memory_checkpointer(), dry_run=dry_run
     )
     cfg = config_for(thread_id)
 

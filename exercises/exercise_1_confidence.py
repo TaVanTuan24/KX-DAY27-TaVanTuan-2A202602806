@@ -32,6 +32,7 @@ from common.schemas import (
     PRAnalysis,
     ReviewState,
     audit_risk_level,
+    confidence_only_route,
     has_blocking_risk,
     route_for,
 )
@@ -92,12 +93,16 @@ def node_route(state: ReviewState) -> dict:
     console.print("[cyan]→ route[/cyan]")
     analysis = state["analysis"]
     decision = route_for(analysis)
-    override = ""
-    if decision == "human_approval" and has_blocking_risk(analysis):
-        override = "  [red](security/blocker override)[/red]"
+    # The security override can only ever pull an `auto_approve` down to
+    # `human_approval`; say so only when it actually changed the outcome.
+    overridden = (
+        decision != confidence_only_route(analysis)
+        and has_blocking_risk(analysis)
+    )
+    suffix = "  [red](security/blocker override)[/red]" if overridden else ""
     console.print(
         f"  [green]✓[/green] decision=[bold]{decision}[/bold] "
-        f"(confidence={analysis.confidence:.0%}){override}"
+        f"(confidence={analysis.confidence:.0%}){suffix}"
     )
     return {"decision": decision}
 

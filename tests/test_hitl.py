@@ -9,7 +9,7 @@ no comment posted before (or twice after) approval.
 from __future__ import annotations
 
 import pytest
-from langgraph.checkpoint.memory import MemorySaver
+from common.db import memory_checkpointer
 from langgraph.types import Command
 
 from exercises.agent import Mode, build_graph, config_for
@@ -26,7 +26,7 @@ def graph_factory():
         factory = FakeLLMFactory(*analyses)
         gh = github or FakeGitHub()
         app = build_graph(
-            mode=mode, checkpointer=MemorySaver(), llm_factory=factory, github=gh, dry_run=dry_run
+            mode=mode, checkpointer=memory_checkpointer(), llm_factory=factory, github=gh, dry_run=dry_run
         )
         return app, factory, gh
 
@@ -208,7 +208,7 @@ async def test_thread_id_is_used_as_the_posting_idempotency_key() -> None:
     """The idempotency key travels with the post so a retry cannot duplicate it."""
     factory = FakeLLMFactory(make_analysis(0.65))
     gh = FakeGitHub()
-    app = build_graph(mode=Mode.EXERCISE_2, checkpointer=MemorySaver(), llm_factory=factory, github=gh)
+    app = build_graph(mode=Mode.EXERCISE_2, checkpointer=memory_checkpointer(), llm_factory=factory, github=gh)
     await app.ainvoke({"pr_url": PR_URL, "thread_id": "t-dup"}, config_for("t-dup"))
     await app.ainvoke(Command(resume={"choice": "approve"}), config_for("t-dup"))
     assert len(gh.posts) == 1
@@ -259,7 +259,7 @@ def test_escalation_wiring_per_mode(mode: Mode, expects_final_approval: bool) ->
     """The final-confirmation gate exists exactly where the README requires it."""
     app = build_graph(
         mode=mode,
-        checkpointer=MemorySaver(),
+        checkpointer=memory_checkpointer(),
         llm_factory=FakeLLMFactory(make_analysis(0.2)),
         github=FakeGitHub(),
     )

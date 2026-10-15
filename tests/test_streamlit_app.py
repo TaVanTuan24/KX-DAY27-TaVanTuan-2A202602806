@@ -18,7 +18,7 @@ import types
 from typing import Any
 
 import pytest
-from langgraph.checkpoint.memory import MemorySaver
+from common.db import memory_checkpointer
 from langgraph.types import Command
 
 from tests.conftest import PR_URL, FakeGitHub, FakeLLMFactory, make_analysis
@@ -205,7 +205,7 @@ def test_interrupt_payload_extracts_from_a_real_graph_result(app_stub) -> None:
 
     app = build_graph(
         mode=Mode.EXERCISE_5,
-        checkpointer=MemorySaver(),
+        checkpointer=memory_checkpointer(),
         llm_factory=FakeLLMFactory(make_analysis(0.65)),
         github=FakeGitHub(),
     )
@@ -416,7 +416,7 @@ def test_ui_resume_values_drive_the_real_graph(app_stub) -> None:
     gh = FakeGitHub()
     app = build_graph(
         mode=Mode.EXERCISE_5,
-        checkpointer=MemorySaver(),
+        checkpointer=memory_checkpointer(),
         llm_factory=FakeLLMFactory(make_analysis(0.65)),
         github=gh,
     )
@@ -442,7 +442,7 @@ def test_ui_reject_path_posts_nothing(app_stub) -> None:
     gh = FakeGitHub()
     app = build_graph(
         mode=Mode.EXERCISE_5,
-        checkpointer=MemorySaver(),
+        checkpointer=memory_checkpointer(),
         llm_factory=FakeLLMFactory(make_analysis(0.65)),
         github=gh,
     )

@@ -317,6 +317,26 @@ async def test_failed_post_is_audited_as_failed_and_reported(
     assert commit["status"] == "failed"
 
 
+async def test_dry_run_is_never_audited_as_committed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An auditor filtering on `decision` must not read a rehearsal as a post."""
+    monkeypatch.setenv("HITL_DB_PATH", str(tmp_path / "hitl.db"))
+    gh = FakeGitHub()
+    results, _, _, _ = await _run(
+        tmp_path, "t-dry", [make_analysis(0.95)], github=gh, dry_run=True
+    )
+    assert results[-1]["final_action"] == "auto_approved_dry_run"
+    assert gh.posts == []
+
+    events = await replay_events("t-dry")
+    terminal = events[-1]
+    assert terminal["decision"] == "dry_run"
+    assert terminal["decision"] not in {"committed", "auto"}
+    assert "would be posted" in terminal["reason"]
+    assert not any(e["decision"] in {"committed", "auto"} for e in events)
+
+
 # ─── replay ────────────────────────────────────────────────────────────────
 
 

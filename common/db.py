@@ -219,6 +219,18 @@ def checkpoint_serde():
     return JsonPlusSerializer(allowed_msgpack_modules=CHECKPOINT_ALLOWED_MODULES)
 
 
+def memory_checkpointer():
+    """In-process checkpointer using the same explicit allowlist.
+
+    Exercise 2's skeleton asks for ``MemorySaver``; this is that, minus the
+    permissive default serializer (which emits a warning today and will refuse
+    unserializable types in a future LangGraph release).
+    """
+    from langgraph.checkpoint.memory import MemorySaver
+
+    return MemorySaver(serde=checkpoint_serde())
+
+
 @asynccontextmanager
 async def open_checkpointer(
     conn_string: str | None = None,
