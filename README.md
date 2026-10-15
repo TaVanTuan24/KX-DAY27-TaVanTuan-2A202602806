@@ -300,8 +300,8 @@ uv run python -m audit.replay --thread <thread_id>
 ## Testing
 
 ```bash
-uv run pytest                       # 184 tests, no API key, no network
-uv run pytest -m "not slow"         # 174 fast tests (skips the real-Streamlit-runner ones)
+uv run pytest                       # 205 tests, no API key, no network
+uv run pytest -m "not slow"         # 195 fast tests (skips the real-Streamlit-runner ones)
 uv run pytest tests/test_routing.py -v
 ```
 
