@@ -35,16 +35,22 @@ from langgraph.types import Command
 
 from common.github import GitHubError, is_valid_pr_url
 from exercises.agent import Mode, build_graph, config_for, console
-from exercises.cli import handle_interrupt
+from exercises.cli import (
+    EXIT_BAD_INPUT,
+    EXIT_FAILURE,
+    EXIT_INTERRUPTED,
+    handle_interrupt,
+    report_exit,
+)
 
 
 async def run(pr_url: str, thread_id: str, *, dry_run: bool = False) -> dict:
-    app = build_graph(
-        mode=Mode.EXERCISE_3, checkpointer=memory_checkpointer(), dry_run=dry_run
-    )
+    app = build_graph(mode=Mode.EXERCISE_3, checkpointer=memory_checkpointer(), dry_run=None)
     cfg = config_for(thread_id)
 
-    result = await app.ainvoke({"pr_url": pr_url, "thread_id": thread_id}, cfg)
+    result = await app.ainvoke(
+        {"pr_url": pr_url, "thread_id": thread_id, "dry_run": dry_run}, cfg
+    )
     while "__interrupt__" in result:
         payload = result["__interrupt__"][0].value
         result = await app.ainvoke(Command(resume=handle_interrupt(payload)), cfg)
@@ -65,7 +71,7 @@ def main() -> None:
 
     if not is_valid_pr_url(args.pr):
         console.print(f"[red]✗ Not a GitHub PR URL:[/red] {args.pr}")
-        raise SystemExit(2)
+        raise SystemExit(EXIT_BAD_INPUT)
 
     console.rule("[bold]Exercise 3 — escalation with reviewer Q&A[/bold]")
     console.print(f"[dim]PR: {args.pr}[/dim]\n")
@@ -80,23 +86,14 @@ def main() -> None:
         result = asyncio.run(run(args.pr, thread_id, dry_run=args.dry_run))
     except GitHubError as exc:
         console.print(f"[red]✗ GitHub error:[/red] {exc.friendly}")
-        raise SystemExit(1) from exc
+        raise SystemExit(EXIT_FAILURE) from exc
     except KeyboardInterrupt:
         console.print(f"\n[yellow]Interrupted.[/yellow] thread_id = {thread_id}")
-        raise SystemExit(130)
+        raise SystemExit(EXIT_INTERRUPTED)
 
     console.rule("Final")
     console.print(f"decision     = {result.get('decision')}")
     console.print(f"final_action = {result.get('final_action')}")
-    if result.get("fetch_error") or result.get("analysis_error"):
-        console.print(
-            f"[red]error[/red]        = {result.get('fetch_error') or result.get('analysis_error')}"
-        )
-        console.print("[red]Nothing was posted to GitHub.[/red]")
-        raise SystemExit(1)
-    if result.get("post_error"):
-        console.print(f"[red]error[/red]        = {result['post_error']}")
-        raise SystemExit(1)
     if "analysis" in result:
         console.print(f"final confidence = {result['analysis'].confidence:.0%}")
         console.print(
@@ -106,6 +103,7 @@ def main() -> None:
         console.print("[dim]reviewer answers recorded:[/dim]")
         for q, a in result["escalation_answers"].items():
             console.print(f"  [dim]• {q}[/dim] → {a or '(no answer)'}")
+    raise SystemExit(report_exit(result))
 
 
 if __name__ == "__main__":

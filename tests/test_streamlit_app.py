@@ -262,7 +262,6 @@ def test_approval_card_renders_reasoning_comments_and_diff(app_stub) -> None:
     [
         ("✅ Approve", "approve"),
         ("⛔ Reject", "reject"),
-        ("✏️ Edit", "edit"),
     ],
 )
 def test_approval_card_returns_the_clicked_choice(app_stub, button: str, expected_choice: str) -> None:
@@ -271,6 +270,224 @@ def test_approval_card_returns_the_clicked_choice(app_stub, button: str, expecte
     stub.values["approval_feedback"] = "my note"
     answer = module.render_approval_card(dict(APPROVAL_PAYLOAD))
     assert answer == {"choice": expected_choice, "feedback": "my note"}
+
+
+# ─── FIX 1: Edit opens a form, it does not resume immediately ──────────────
+
+
+def test_edit_button_opens_the_edit_form_instead_of_resuming(app_stub) -> None:
+    """The old behaviour sent `{"choice": "edit"}` with no instructions at all."""
+    module, stub = app_stub
+    module.init_state()
+    stub.pressed = {"✏️ Edit"}
+
+    answer = module.render_approval_card(dict(APPROVAL_PAYLOAD))
+
+    assert answer is None, "Edit must not resume the graph on its own"
+    assert stub.session_state["edit_mode"] is True
+    assert "edit_instructions_input" in {
+        c[2].get("key") for c in stub.called("text_area")
+    }
+
+
+def test_edit_form_returns_instructions_and_or_replacement_text(app_stub) -> None:
+    module, stub = app_stub
+    module.init_state()
+    stub.session_state["edit_mode"] = True
+    stub.pressed = {"▶️ Apply edit"}
+    stub.values["edit_instructions_input"] = "drop the ordering nit"
+    stub.values["edit_body_input"] = ""
+
+    answer = module.render_approval_card(dict(APPROVAL_PAYLOAD))
+
+    assert answer == {
+        "choice": "edit",
+        "feedback": "drop the ordering nit",
+        "edited_body": None,
+    }
+
+
+def test_edit_form_can_send_verbatim_replacement_text(app_stub) -> None:
+    module, stub = app_stub
+    module.init_state()
+    stub.session_state["edit_mode"] = True
+    stub.pressed = {"▶️ Apply edit"}
+    stub.values["edit_instructions_input"] = ""
+    stub.values["edit_body_input"] = "### My own review"
+
+    answer = module.render_approval_card(dict(APPROVAL_PAYLOAD))
+    assert answer["edited_body"] == "### My own review"
+
+
+def test_apply_edit_with_nothing_typed_warns_and_does_not_resume(app_stub) -> None:
+    module, stub = app_stub
+    module.init_state()
+    stub.session_state["edit_mode"] = True
+    stub.pressed = {"▶️ Apply edit"}  # no values → both boxes empty
+
+    assert module.render_approval_card(dict(APPROVAL_PAYLOAD)) is None
+    assert any("Enter instructions or paste" in str(c) for c in stub.called("warning"))
+
+
+def test_cancel_edit_leaves_the_session_paused(app_stub) -> None:
+    module, stub = app_stub
+    module.init_state()
+    stub.session_state["edit_mode"] = True
+    stub.pressed = {"Cancel edit"}
+
+    assert module.render_approval_card(dict(APPROVAL_PAYLOAD)) is None
+    assert stub.session_state["edit_mode"] is False
+
+
+# ─── FIX 1: the edited-review gate ─────────────────────────────────────────
+
+
+EDITED_PAYLOAD = {
+    "kind": "edited_review",
+    "pr_url": PR_URL,
+    "thread_id": "t-ui",
+    "confidence": 0.6,
+    "confidence_reasoning": "Presented differently; the same risks remain.",
+    "summary": "Revised summary.",
+    "risk_factors": ["MD5 password hashing"],
+    "comments": [
+        {"file": "app/auth.py", "line": 12, "severity": "blocker", "body": "MD5 hashing"}
+    ],
+    "revision": 2,
+    "proposed_body": "### Automated review\n\nRevised.",
+    "diff_preview": "+hashlib.md5(...)",
+}
+
+
+def test_edited_review_card_confirms_posting(app_stub) -> None:
+    module, stub = app_stub
+    module.init_state()
+    stub.pressed = {"📮 Confirm & post"}
+
+    answer = module.render_edited_review_card(dict(EDITED_PAYLOAD))
+
+    assert answer == {"confirm": True, "feedback": ""}
+    rendered = " ".join(str(c) for c in stub.calls)
+    assert "revision 2" in rendered
+    assert "Revised summary." in rendered
+    assert "Nothing has been posted to GitHub yet." in rendered
+
+
+def test_edited_review_card_can_reject(app_stub) -> None:
+    module, stub = app_stub
+    module.init_state()
+    stub.pressed = {"⛔ Cancel / reject"}
+    answer = module.render_edited_review_card(dict(EDITED_PAYLOAD))
+    assert answer == {"confirm": False, "feedback": ""}
+
+
+def test_edited_review_card_edit_again_opens_another_revision(app_stub) -> None:
+    module, stub = app_stub
+    module.init_state()
+    stub.pressed = {"✏️ Edit again"}
+
+    assert module.render_edited_review_card(dict(EDITED_PAYLOAD)) is None
+    assert stub.session_state["edit_mode"] is True
+
+    stub.pressed = {"▶️ Apply another revision"}
+    stub.values["edit_again_instructions"] = "shorter"
+    answer = module.render_edited_review_card(dict(EDITED_PAYLOAD))
+    assert answer == {"choice": "edit", "feedback": "shorter", "edited_body": None}
+
+
+def test_interrupt_dispatch_handles_the_edited_review_kind(app_stub) -> None:
+    module, stub = app_stub
+    module.init_state()
+    stub.pressed = {"📮 Confirm & post"}
+    assert module.render_interrupt(dict(EDITED_PAYLOAD)) == {"confirm": True, "feedback": ""}
+
+
+# ─── FIX 2: the dry-run toggle is locked for an active session ─────────────
+
+
+def test_reset_for_records_the_session_mode(app_stub) -> None:
+    module, stub = app_stub
+    module.init_state()
+    stub.session_state["dry_run"] = True
+    module.reset_for(PR_URL)
+    assert stub.session_state["session_dry_run"] is True
+
+    stub.session_state["dry_run"] = False
+    module.reset_for(PR_URL)
+    assert stub.session_state["session_dry_run"] is False
+
+
+def test_open_session_restores_the_stored_mode(app_stub) -> None:
+    module, stub = app_stub
+    module.init_state()
+    stub.session_state["dry_run"] = False  # the toggle currently says "live"
+    view = module.SessionView(
+        values={"final_action": "committed_dry_run", "dry_run": True}, dry_run=True
+    )
+    module.open_session(view, "t-old", PR_URL)
+    assert stub.session_state["session_dry_run"] is True
+    assert stub.session_state["dry_run"] is True, "the toggle must show the session mode"
+
+
+def test_open_session_marks_a_finished_session_as_history(app_stub) -> None:
+    module, stub = app_stub
+    module.init_state()
+    view = module.SessionView(values={"final_action": "committed"}, dry_run=False)
+    module.open_session(view, "t-done", PR_URL)
+    assert stub.session_state["session_finished"] is True
+    assert stub.session_state["final"]["final_action"] == "committed"
+    assert stub.session_state["interrupt_payload"] is None
+
+
+def test_open_session_without_a_checkpoint_flags_history_only(app_stub) -> None:
+    module, stub = app_stub
+    module.init_state()
+    module.open_session(module.SessionView(), "t-ghost", PR_URL)
+    assert stub.session_state["history_only"] is True
+    assert stub.session_state["final"] is None
+
+
+# ─── terminal card: every outcome, including the new ones ──────────────────
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_marker"),
+    [
+        ("committed_already", "success"),
+        ("commit_unconfirmed", "error"),
+        ("auto_refused_security", "error"),
+    ],
+)
+def test_new_terminal_outcomes_are_rendered_honestly(
+    app_stub, action: str, expected_marker: str
+) -> None:
+    module, stub = app_stub
+    final = {"final_action": action, "post_error": "detail"}
+    module.render_final(final, PR_URL, "t-ui")
+    assert stub.called(expected_marker), f"expected st.{expected_marker} for {action}"
+
+
+def test_unconfirmed_card_says_it_may_or_may_not_exist(app_stub) -> None:
+    module, stub = app_stub
+    module.render_final({"final_action": "commit_unconfirmed"}, PR_URL, "t")
+    rendered = " ".join(str(c) for c in stub.called("error"))
+    assert "could **not** be confirmed" in rendered
+    assert not stub.called("success")
+
+
+def test_completed_already_card_does_not_claim_a_fresh_post(app_stub) -> None:
+    module, stub = app_stub
+    module.render_final({"final_action": "committed_already"}, PR_URL, "t")
+    rendered = " ".join(str(c) for c in stub.called("success"))
+    assert "already" in rendered and "not** posted a second time" in rendered
+
+
+def test_audit_error_is_surfaced_on_the_terminal_card(app_stub) -> None:
+    module, stub = app_stub
+    module.render_final(
+        {"final_action": "committed", "audit_error": "commit: OperationalError"}, PR_URL, "t"
+    )
+    assert any("audit trail is incomplete" in str(c) for c in stub.called("warning"))
 
 
 def test_approval_card_flags_a_security_pr(app_stub) -> None:

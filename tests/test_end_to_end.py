@@ -55,14 +55,29 @@ async def _start(db: Path, *, analyses, github=None, mode=Mode.EXERCISE_5, dry_r
     Returns ``(cm, app, paused_result)`` — deliberately mimicking a process that
     dies while a session is paused, keeping the context manager so the caller can
     close it (or simulate a crash by closing it and opening a new one).
+
+    ``dry_run`` is seeded into the state (the authoritative place), and the graph is
+    built with ``dry_run=None`` so the state decides — exactly as the CLIs and the
+    Streamlit app do.
     """
     cm = AsyncSqliteSaver.from_conn_string(str(db))
     cp = await cm.__aenter__()
     await cp.setup()
-    app = build_graph(mode=mode, checkpointer=cp, llm_factory=FakeLLMFactory(*analyses),
-                      github=github or FakeGitHub(), dry_run=dry_run)
+    app = build_graph(
+        mode=mode,
+        checkpointer=cp,
+        llm_factory=FakeLLMFactory(*analyses),
+        github=github or FakeGitHub(),
+        dry_run=None,
+    )
     result = await app.ainvoke(
-        {"pr_url": PR_URL, "thread_id": THREAD, "reviewer_id": "tavan"}, config_for(THREAD)
+        {
+            "pr_url": PR_URL,
+            "thread_id": THREAD,
+            "reviewer_id": "tavan",
+            "dry_run": dry_run,
+        },
+        config_for(THREAD),
     )
     return cm, app, result
 
@@ -269,3 +284,218 @@ async def test_e2e_resumes_after_a_simulated_restart(
     assert "Reviewer note: resumed" in gh.posts[0]["body"]
     # 6 events total — the resume did not re-run fetch/analyze in the new process.
     assert len(await replay_events(THREAD)) == 6
+
+
+# ─── the Edit workflow, end to end ─────────────────────────────────────────
+
+
+async def test_e2e_edit_preview_approve_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Edit → preview → confirm → exactly one POST of the revised review."""
+    db = tmp_path / "e2e-edit.db"
+    monkeypatch.setenv("HITL_DB_PATH", str(db))
+    gh = FakeGitHub()
+
+    cm, app, paused = await _start(
+        db,
+        analyses=[
+            _hitl_analysis(),
+            make_analysis(0.6, summary="REVISED SUMMARY", comments=[]),
+        ],
+        github=gh,
+    )
+    try:
+        assert paused["__interrupt__"][0].value["kind"] == "approval_request"
+
+        preview = await app.ainvoke(
+            Command(resume={"choice": "edit", "feedback": "shorten the summary"}),
+            config_for(THREAD),
+        )
+        payload = preview["__interrupt__"][0].value
+        assert payload["kind"] == "edited_review"
+        assert payload["revision"] == 1
+        assert payload["proposed_body"]
+        assert gh.posts == [], "the preview must not post"
+
+        final = await app.ainvoke(
+            Command(resume={"confirm": True, "feedback": ""}), config_for(THREAD)
+        )
+    finally:
+        await _close(cm)
+
+    assert final["final_action"] == "committed"
+    assert len(gh.posts) == 1
+    assert "REVISED SUMMARY" in gh.posts[0]["body"]
+
+    events = await replay_events(THREAD)
+    assert [e["action"] for e in events] == [
+        "fetch_pr", "analyze", "route",
+        "human_approval", "human_approval",
+        "edit_review", "final_edit_approval", "final_edit_approval",
+        "commit",
+    ]
+    assert next(e for e in events if e["action"] == "edit_review")["revision"] == 1
+
+
+async def test_e2e_edit_then_reject(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db = tmp_path / "e2e-edit-rej.db"
+    monkeypatch.setenv("HITL_DB_PATH", str(db))
+    gh = FakeGitHub()
+
+    cm, app, _ = await _start(
+        db, analyses=[_hitl_analysis(), make_analysis(0.6)], github=gh
+    )
+    try:
+        await app.ainvoke(
+            Command(resume={"choice": "edit", "feedback": "reword"}), config_for(THREAD)
+        )
+        final = await app.ainvoke(
+            Command(resume={"confirm": False, "feedback": "not good enough"}),
+            config_for(THREAD),
+        )
+    finally:
+        await _close(cm)
+
+    assert final["final_action"] == "rejected"
+    assert gh.posts == []
+    assert next(
+        e for e in await replay_events(THREAD) if e["action"] == "commit"
+    )["decision"] == "reject"
+
+
+async def test_e2e_edit_again_then_approve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two revisions in one thread, then one POST of the second."""
+    db = tmp_path / "e2e-edit2.db"
+    monkeypatch.setenv("HITL_DB_PATH", str(db))
+    gh = FakeGitHub()
+
+    cm, app, _ = await _start(
+        db,
+        analyses=[
+            _hitl_analysis(),
+            make_analysis(0.6, summary="REV ONE"),
+            make_analysis(0.55, summary="REV TWO"),
+        ],
+        github=gh,
+    )
+    try:
+        first = await app.ainvoke(
+            Command(resume={"choice": "edit", "feedback": "one"}), config_for(THREAD)
+        )
+        assert first["__interrupt__"][0].value["revision"] == 1
+
+        second = await app.ainvoke(
+            Command(resume={"choice": "edit", "feedback": "two"}), config_for(THREAD)
+        )
+        assert second["__interrupt__"][0].value["revision"] == 2
+        assert gh.posts == []
+
+        final = await app.ainvoke(
+            Command(resume={"confirm": True, "feedback": ""}), config_for(THREAD)
+        )
+    finally:
+        await _close(cm)
+
+    assert final["final_action"] == "committed"
+    assert len(gh.posts) == 1
+    assert "REV TWO" in gh.posts[0]["body"]
+
+    # Audit replay across both revisions: each round is recorded, nothing is lost.
+    events = await replay_events(THREAD)
+    revisions = [e["revision"] for e in events if e["action"] == "edit_review"]
+    assert revisions == [1, 2]
+    keys = [(e["action"], e["status"], e["decision"], e["revision"]) for e in events]
+    assert len(set(keys)) == len(keys), "no unintended duplicate audit rows"
+
+
+# ─── ambiguous POST and dry-run durability ─────────────────────────────────
+
+
+async def test_e2e_unconfirmed_post_is_reported_and_never_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timeout after the POST must not be retried and must not read as success."""
+    from common.github import PostStatus
+
+    db = tmp_path / "e2e-unconfirmed.db"
+    monkeypatch.setenv("HITL_DB_PATH", str(db))
+    gh = FakeGitHub(post_status=PostStatus.UNCONFIRMED)
+
+    cm, app, _ = await _start(db, analyses=[_hitl_analysis()], github=gh)
+    try:
+        final = await app.ainvoke(
+            Command(resume={"choice": "approve", "feedback": ""}), config_for(THREAD)
+        )
+    finally:
+        await _close(cm)
+
+    assert final["final_action"] == "commit_unconfirmed"
+    assert final["post_status"] == "unconfirmed"
+    assert gh.posts == [], "an unconfirmed post must not be recorded as posted"
+
+    commit = next(e for e in await replay_events(THREAD) if e["action"] == "commit")
+    assert commit["decision"] == "unconfirmed"
+    assert commit["status"] == "failed"
+    assert "not retried" in commit["reason"]
+
+
+async def test_e2e_already_posted_is_reported_distinctly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from common.github import PostStatus
+
+    db = tmp_path / "e2e-already.db"
+    monkeypatch.setenv("HITL_DB_PATH", str(db))
+    gh = FakeGitHub(post_status=PostStatus.ALREADY_POSTED)
+
+    cm, app, _ = await _start(db, analyses=[_hitl_analysis()], github=gh)
+    try:
+        final = await app.ainvoke(
+            Command(resume={"choice": "approve", "feedback": ""}), config_for(THREAD)
+        )
+    finally:
+        await _close(cm)
+
+    assert final["final_action"] == "committed_already"
+    assert final["post_status"] == "already_posted"
+    commit = next(e for e in await replay_events(THREAD) if e["action"] == "commit")
+    assert commit["decision"] == "committed"
+    assert "Already on the PR" in commit["reason"]
+
+
+async def test_e2e_dry_run_survives_a_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FIX 2 across processes: the rehearsal stays a rehearsal after a restart."""
+    db = tmp_path / "e2e-dry-restart.db"
+    monkeypatch.setenv("HITL_DB_PATH", str(db))
+    gh = FakeGitHub()
+
+    cm1, app1, paused = await _start(
+        db, analyses=[_hitl_analysis()], github=gh, dry_run=True
+    )
+    await _close(cm1)
+
+    cm2 = AsyncSqliteSaver.from_conn_string(str(db))
+    cp2 = await cm2.__aenter__()
+    await cp2.setup()
+    try:
+        # Rebuilt deliberately as "live": the stored mode must win.
+        app2 = build_graph(
+            mode=Mode.EXERCISE_5,
+            checkpointer=cp2,
+            llm_factory=FakeLLMFactory(),
+            github=gh,
+            dry_run=False,
+        )
+        final = await app2.ainvoke(
+            Command(resume={"choice": "approve", "feedback": ""}), config_for(THREAD)
+        )
+    finally:
+        await _close(cm2)
+
+    assert gh.posts == [], "a restarted dry-run session must not post"
+    assert final["final_action"] == "committed_dry_run"
+    assert final["post_status"] == "dry_run"
+    assert (await replay_events(THREAD))[-1]["decision"] == "dry_run"

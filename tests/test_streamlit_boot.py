@@ -136,7 +136,8 @@ def test_reject_flow_through_the_widgets(app_test) -> None:
     assert "Rejected" in _texts(at)
 
 
-def test_edit_without_feedback_warns_instead_of_resuming(app_test) -> None:
+def test_edit_button_opens_a_form_and_posts_nothing(app_test) -> None:
+    """FIX 1 in the real UI: Edit shows a form; it does not resume or POST."""
     at, build, gh = app_test
     build(make_analysis(0.65))
     at.text_input[0].set_value(PR_URL)
@@ -144,8 +145,66 @@ def test_edit_without_feedback_warns_instead_of_resuming(app_test) -> None:
 
     next(b for b in at.button if "Edit" in b.label).click().run()
     assert not at.exception, at.exception
-    assert any("Edit selected" in w.value for w in at.warning)
+    assert gh.posts == [], "opening the edit form must not post"
+    assert any(ta.key == "edit_instructions_input" for ta in at.text_area), (
+        "the edit form should be visible"
+    )
+
+
+def test_applying_an_empty_edit_warns_instead_of_resuming(app_test) -> None:
+    at, build, gh = app_test
+    build(make_analysis(0.65))
+    at.text_input[0].set_value(PR_URL)
+    at.button[0].click().run()
+    next(b for b in at.button if "Edit" in b.label).click().run()
+
+    next(b for b in at.button if "Apply edit" in b.label).click().run()
+    assert not at.exception, at.exception
+    assert any("Enter instructions or paste" in w.value for w in at.warning)
     assert gh.posts == []  # still paused
+
+
+def test_edit_through_the_ui_previews_then_posts_on_confirm(app_test) -> None:
+    """FIX 1 end to end in the real UI: Edit → preview → Confirm → one POST."""
+    at, build, gh = app_test
+    build(
+        make_analysis(0.65, summary="ORIGINAL SUMMARY"),
+        make_analysis(0.6, summary="REVISED SUMMARY"),
+    )
+    at.text_input[0].set_value(PR_URL)
+    at.button[0].click().run()
+
+    next(b for b in at.button if "Edit" in b.label).click().run()
+    at.text_area(key="edit_instructions_input").set_value("shorten the summary")
+    next(b for b in at.button if "Apply edit" in b.label).click().run()
+    assert not at.exception, at.exception
+
+    rendered = _texts(at)
+    assert "Edited review" in rendered
+    assert "REVISED SUMMARY" in rendered
+    assert "Nothing has been posted to GitHub yet." in rendered
+    assert gh.posts == [], "the revised review must not be posted before confirmation"
+
+    next(b for b in at.button if "Confirm & post" in b.label).click().run()
+    assert not at.exception, at.exception
+    assert len(gh.posts) == 1
+    assert "REVISED SUMMARY" in gh.posts[0]["body"]
+    assert "ORIGINAL SUMMARY" not in gh.posts[0]["body"]
+
+
+def test_edit_then_cancel_posts_nothing_through_the_ui(app_test) -> None:
+    at, build, gh = app_test
+    build(make_analysis(0.65), make_analysis(0.6))
+    at.text_input[0].set_value(PR_URL)
+    at.button[0].click().run()
+    next(b for b in at.button if "Edit" in b.label).click().run()
+    at.text_area(key="edit_instructions_input").set_value("shorter")
+    next(b for b in at.button if "Apply edit" in b.label).click().run()
+
+    next(b for b in at.button if "Cancel / reject" in b.label).click().run()
+    assert not at.exception, at.exception
+    assert gh.posts == []
+    assert "Rejected" in _texts(at)
 
 
 def _answer_questions(at, *answers: str) -> None:

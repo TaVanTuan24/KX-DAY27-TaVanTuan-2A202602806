@@ -80,13 +80,18 @@ async def replay(thread_id: str) -> None:
         status_colored = f"[{STATUS_COLOR.get(status, 'white')}]{status:<9}[/]"
         reviewer = ev["reviewer_id"] or "-"
         reason = (ev["reason"] or "")[:60]
+        # `rev` is only meaningful once a review has been edited (revision >= 1);
+        # showing it lets an auditor tell two Edit rounds apart.
+        revision = ev.get("revision") or 0
+        rev_colored = f"rev=[bold]{revision}[/bold] " if revision else "        "
         console.print(
             f"[dim]{ev['timestamp']}[/dim]  "
-            f"[cyan]{ev['action']:<15}[/cyan] "
+            f"[cyan]{ev['action']:<18}[/cyan] "
             f"conf=[bold]{ev['confidence']:.2f}[/bold] "
             f"risk={risk_colored} "
             f"decision=[magenta]{ev['decision']:<10}[/magenta] "
             f"status={status_colored} "
+            f"{rev_colored}"
             f"reviewer={reviewer:<14} "
             f"{ev['execution_time_ms']:>5}ms  "
             f"[dim]{reason}[/dim]"

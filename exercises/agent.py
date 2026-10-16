@@ -33,6 +33,7 @@ import asyncio
 import logging
 import os
 import time
+from collections.abc import Mapping
 from enum import Enum
 from typing import Any, Callable, Protocol
 
@@ -43,13 +44,20 @@ from rich.console import Console
 from common.db import memory_checkpointer
 from common.github import (
     GitHubError,
+    PostResult,
+    PostStatus,
     PullRequest,
     current_user,
     fetch_pr,
     post_review_comment,
 )
 from common.llm import StructuredOutputLLM, get_llm, structured_llm
-from common.prompts import build_analyze_messages, build_synthesize_messages, force_utf8_stdio
+from common.prompts import (
+    build_analyze_messages,
+    build_edit_messages,
+    build_synthesize_messages,
+    force_utf8_stdio,
+)
 from common.schemas import (
     AuditEntry,
     PRAnalysis,
@@ -112,7 +120,9 @@ class GitHubService(Protocol):
 
     def fetch_pr(self, pr_url: str) -> PullRequest: ...
 
-    def post_review_comment(self, pr_url: str, body: str, *, thread_id: str) -> str: ...
+    def post_review_comment(
+        self, pr_url: str, body: str, *, thread_id: str
+    ) -> PostResult: ...
 
     def current_user(self) -> str | None: ...
 
@@ -130,7 +140,7 @@ class RealGitHubService:
     def fetch_pr(self, pr_url: str) -> PullRequest:
         return fetch_pr(pr_url)
 
-    def post_review_comment(self, pr_url: str, body: str, *, thread_id: str) -> str:
+    def post_review_comment(self, pr_url: str, body: str, *, thread_id: str) -> PostResult:
         return post_review_comment(pr_url, body, thread_id=thread_id)
 
     def current_user(self) -> str | None:
@@ -180,10 +190,21 @@ def _reviewer_id(state: dict, github: GitHubService) -> str | None:
 def build_comment_body(state: ReviewState) -> str:
     """Markdown body posted back to the PR.
 
-    Escalation answers may be long; a comment also gets unwieldy with every
-    answer inline, but they are the evidence for the refined review, so they are
-    included (quoted) rather than dropped.
+    Precedence:
+
+    1. ``edited_comment_body`` — the reviewer wrote/replaced this text themselves.
+       Human-authored content is posted **verbatim**: the LLM never overwrites it
+       and nothing is appended except the thread marker added by the client.
+    2. Otherwise the review is rendered from ``analysis`` (initial, refined, or
+       LLM-edited), with the escalation answers and reviewer notes attached.
+
+    Escalation answers may be long, but they are the evidence for the refined
+    review, so they are included (quoted) rather than dropped.
     """
+    human_body = (state.get("edited_comment_body") or "").strip()
+    if human_body:
+        return human_body
+
     analysis: PRAnalysis = state["analysis"]
     lines = [
         f"### Automated review (confidence {analysis.confidence:.0%})",
@@ -215,6 +236,10 @@ def build_comment_body(state: ReviewState) -> str:
         lines.append(f"_Reviewer note: {state['human_feedback']}_")
     if state.get("refine_confirmed") is not None:
         lines.append("_Reviewer confirmed posting after escalation._")
+    if state.get("edit_revision"):
+        lines.append(
+            f"_Review revised by the reviewer (revision {state['edit_revision']})._"
+        )
     return "\n".join(lines).strip()
 
 
@@ -232,14 +257,48 @@ class Agent:
         github: GitHubService | None = None,
         audit_sink: AuditSink | None = None,
         clock: _Clock | None = None,
-        dry_run: bool = False,
+        dry_run: bool | None = False,
     ) -> None:
         self.mode = mode
         self.llm_factory: LLMFactory = llm_factory or RealLLMFactory()
         self.github: GitHubService = github or RealGitHubService()
         self.audit_sink: AuditSink = audit_sink or _default_audit_sink
         self.clock = clock or _Clock()
+        #: Fallback only. The authoritative value lives in the graph state so a
+        #: resume cannot flip a rehearsal into a real post; see
+        #: :meth:`effective_dry_run`.
         self.dry_run = dry_run
+        #: Last audit-write failure, surfaced into the state by the terminal nodes
+        #: so a "successful" run with no audit evidence cannot pass silently.
+        self.audit_error: str | None = None
+
+    # -- configuration -----------------------------------------------------
+    def effective_dry_run(self, state: Mapping[str, Any] | dict) -> bool:
+        """Whether THIS session may touch GitHub.
+
+        Precedence (this is the whole FIX-2 contract):
+
+        1. ``state["dry_run"]`` — persisted when the thread was created. A resume
+           therefore keeps the original mode no matter what the caller passes to
+           ``build_graph``.
+        2. ``self.dry_run`` — explicit configuration for callers that never seed
+           the state (direct API/tests).
+        3. ``None`` → **True**: a checkpoint with no recorded mode is of unknown
+           provenance, so the safe answer is "do not post".
+        """
+        if isinstance(state, Mapping) and "dry_run" in state:
+            return bool(state["dry_run"])
+        if self.dry_run is None:
+            return True
+        return bool(self.dry_run)
+
+    def dry_run_origin(self, state: Mapping[str, Any] | dict) -> str:
+        """Where the effective dry-run value came from (for logs/audit)."""
+        if isinstance(state, Mapping) and "dry_run" in state:
+            return "session"
+        if self.dry_run is None:
+            return "fail-safe (no dry_run recorded in this checkpoint)"
+        return "config"
 
     # -- audit -------------------------------------------------------------
     async def audit(
@@ -254,8 +313,14 @@ class Agent:
         reason: str | None = None,
         execution_time_ms: int = 0,
         reviewer_id: str | None = None,
+        revision: int | None = None,
     ) -> None:
-        """Emit one audit row (no-op unless the mode has audit enabled)."""
+        """Emit one audit row (no-op unless the mode has audit enabled).
+
+        A failure is logged *and* recorded in ``self.audit_error`` so the terminal
+        node can surface it: a mode that promises an audit trail must not report
+        success with no evidence of the decision.
+        """
         if not self.mode.has_audit:
             return
         entry = AuditEntry(
@@ -266,14 +331,19 @@ class Agent:
             reviewer_id=reviewer_id,
             decision=decision,
             status=status,
+            revision=state.get("edit_revision", 0) if revision is None else revision,
             reason=_clip(reason),
             execution_time_ms=execution_time_ms,
         )
         try:
             await self.audit_sink(state, entry)
-        except Exception as exc:  # auditing must never break a review session
+            self.audit_error = None
+        except Exception as exc:
+            self.audit_error = f"{action}: {type(exc).__name__}: {exc}"
             logger.warning("audit write failed for %s: %s", action, exc)
-            console.print(f"  [yellow]![/yellow] audit write failed: {exc}")
+            console.print(
+                f"  [yellow]![/yellow] audit write failed for {action}: {exc}"
+            )
 
     # -- fetch_pr ----------------------------------------------------------
     async def node_fetch_pr(self, state: ReviewState) -> dict:
@@ -466,8 +536,15 @@ class Agent:
         response = response or {}
         choice = response.get("choice") or "reject"
         feedback = response.get("feedback") or ""
+        # An `edit` response may carry the reviewer's replacement text directly
+        # (`edited_body`). That is human-authored content and is what gets posted,
+        # verbatim — see `build_comment_body`.
+        edited_body = (response.get("edited_body") or "").strip() or None
         reviewer = _reviewer_id(state, self.github)
-        console.print(f"  [green]✓[/green] reviewer chose [bold]{choice}[/bold]")
+        console.print(
+            f"  [green]✓[/green] reviewer chose [bold]{choice}[/bold]"
+            + (" (with replacement text)" if edited_body else "")
+        )
 
         await self.audit(
             state,
@@ -482,6 +559,217 @@ class Agent:
         )
         return {
             "human_choice": choice,
+            "human_feedback": feedback or None,
+            "reviewer_id": reviewer,
+            # `edit` continues into the Edit loop instead of ending the graph.
+            "edit_instructions": feedback or None if choice == "edit" else None,
+            "edited_comment_body": edited_body if choice == "edit" else None,
+        }
+
+    # -- Edit loop ---------------------------------------------------------
+    async def node_edit_review(self, state: ReviewState) -> dict:
+        """Revise the review after the reviewer chose Edit.
+
+        Two ways in, in priority order:
+
+        * ``edited_comment_body`` (the reviewer typed the replacement review) —
+          stored as-is and NOT touched by the LLM. Human edits win.
+        * otherwise the reviewer's ``edit_instructions`` are applied by the LLM,
+          with the same guarantees as synthesis: blocker findings survive, and
+          confidence is never raised.
+        """
+        revision = int(state.get("edit_revision") or 0) + 1
+        console.print(f"[cyan]→ edit_review[/cyan] (revision {revision})")
+        t0 = self.clock.now()
+        current: PRAnalysis = state["analysis"]
+        instructions = (state.get("edit_instructions") or "").strip()
+        human_body = (state.get("edited_comment_body") or "").strip()
+
+        if human_body:
+            console.print(
+                "  [green]✓[/green] using the reviewer's replacement text verbatim "
+                f"({len(human_body)} chars) — the LLM will not touch it"
+            )
+            await self.audit(
+                state,
+                action="edit_review",
+                confidence=current.confidence,
+                risk_level=audit_risk_level(current),
+                decision="edit",
+                status="done",
+                reason=f"revision {revision}: reviewer supplied the review text verbatim",
+                execution_time_ms=self.clock.elapsed_ms(t0),
+                reviewer_id=state.get("reviewer_id"),
+                revision=revision,
+            )
+            return {
+                "edit_revision": revision,
+                "analysis": current,
+                "refined": True,
+            }
+
+        if not instructions:
+            # Nothing to apply: keep the review as-is rather than guess.
+            console.print("  [yellow]![/yellow] no edit instructions — review unchanged")
+            await self.audit(
+                state,
+                action="edit_review",
+                confidence=current.confidence,
+                risk_level=audit_risk_level(current),
+                decision="edit",
+                status="done",
+                reason=f"revision {revision}: no instructions given, review unchanged",
+                execution_time_ms=self.clock.elapsed_ms(t0),
+                reviewer_id=state.get("reviewer_id"),
+                revision=revision,
+            )
+            return {"edit_revision": revision}
+
+        messages = build_edit_messages(
+            title=state.get("pr_title", ""),
+            diff=state.get("pr_diff", ""),
+            current=current,
+            instructions=instructions,
+            revision=revision,
+            files=state.get("pr_files") or [],
+        )
+        try:
+            with console.status("[dim]LLM revising the review...[/dim]"):
+                revised = await self.llm_factory(temperature=0.2).ainvoke(messages)
+        except Exception as exc:
+            message = f"LLM edit failed: {type(exc).__name__}: {exc}"
+            console.print(f"  [red]✗[/red] {message}")
+            await self.audit(
+                state,
+                action="edit_review",
+                confidence=current.confidence,
+                risk_level=audit_risk_level(current),
+                decision="failed",
+                status="failed",
+                reason=message,
+                execution_time_ms=self.clock.elapsed_ms(t0),
+                reviewer_id=state.get("reviewer_id"),
+                revision=revision,
+            )
+            return {"edit_revision": revision, "analysis_error": message, "refined": False}
+
+        # Same guarantees as synthesis: an edit instruction cannot delete a blocker
+        # or talk the model into being more certain.
+        revised = _keep_blockers_revised(revised, current)
+        if revised.confidence > current.confidence:
+            revised = revised.model_copy(
+                update={
+                    "confidence": current.confidence,
+                    "confidence_reasoning": (
+                        f"{revised.confidence_reasoning} "
+                        f"(confidence capped at the previous {current.confidence:.2f}: "
+                        "an editorial revision does not change how certain the review is)"
+                    ),
+                }
+            )
+
+        console.print(
+            f"  [green]✓[/green] revision {revision}: "
+            f"{len(revised.comments)} finding(s), confidence={revised.confidence:.0%}"
+        )
+        await self.audit(
+            state,
+            action="edit_review",
+            confidence=revised.confidence,
+            risk_level=audit_risk_level(revised),
+            decision="edit",
+            status="done",
+            reason=_clip(
+                f"revision {revision} applied reviewer instructions: {instructions}"
+            ),
+            execution_time_ms=self.clock.elapsed_ms(t0),
+            reviewer_id=state.get("reviewer_id"),
+            revision=revision,
+        )
+        return {"edit_revision": revision, "analysis": revised, "refined": True}
+
+    async def node_final_edit_approval(self, state: ReviewState) -> dict:
+        """Show the edited review and ask whether to post it.
+
+        Answer with ``{"confirm": True|False, "feedback": str}``; an
+        ``{"choice": "edit"}`` answer loops back into ``edit_review`` for another
+        pass. Nothing is posted without a confirmation here.
+        """
+        console.print("[cyan]→ final_edit_approval[/cyan] (interrupt)")
+        t0 = self.clock.now()
+        analysis: PRAnalysis = state["analysis"]
+        revision = int(state.get("edit_revision") or 0)
+
+        await self.audit(
+            state,
+            action="final_edit_approval",
+            confidence=analysis.confidence,
+            risk_level=audit_risk_level(analysis),
+            decision="pending",
+            status="waiting",
+            reason=f"Confirmation requested for revision {revision}",
+            execution_time_ms=self.clock.elapsed_ms(t0),
+            revision=revision,
+        )
+
+        response = interrupt(
+            {
+                "kind": "edited_review",
+                "pr_url": state["pr_url"],
+                "thread_id": state.get("thread_id"),
+                "confidence": analysis.confidence,
+                "confidence_reasoning": analysis.confidence_reasoning,
+                "summary": analysis.summary,
+                "risk_factors": list(analysis.risk_factors),
+                "comments": [c.model_dump() for c in analysis.comments],
+                "revision": revision,
+                "edited_comment_body": state.get("edited_comment_body"),
+                "proposed_body": build_comment_body(state),
+                "diff_preview": (state.get("pr_diff") or "")[:DIFF_PREVIEW_CHARS],
+            }
+        )
+        response = response or {}
+        reviewer = _reviewer_id(state, self.github)
+
+        # "edit again" → another revision; otherwise this is a yes/no on posting.
+        if (response.get("choice") or "").lower() == "edit":
+            console.print("  [yellow]↻[/yellow] reviewer wants another revision")
+            await self.audit(
+                state,
+                action="final_edit_approval",
+                confidence=analysis.confidence,
+                risk_level=audit_risk_level(analysis),
+                decision="edit",
+                status="responded",
+                reason=response.get("feedback") or "another revision requested",
+                execution_time_ms=self.clock.elapsed_ms(t0),
+                reviewer_id=reviewer,
+                revision=revision,
+            )
+            return {
+                "edit_confirmed": None,
+                "edit_instructions": response.get("feedback") or None,
+                "edited_comment_body": (response.get("edited_body") or "").strip() or None,
+                "reviewer_id": reviewer,
+            }
+
+        confirmed = bool(response.get("confirm"))
+        feedback = response.get("feedback") or ""
+        console.print(f"  [green]✓[/green] revision {revision} confirmed: {confirmed}")
+        await self.audit(
+            state,
+            action="final_edit_approval",
+            confidence=analysis.confidence,
+            risk_level=audit_risk_level(analysis),
+            decision="approve" if confirmed else "reject",
+            status="responded",
+            reason=feedback or ("confirmed the edited review" if confirmed else "declined posting"),
+            execution_time_ms=self.clock.elapsed_ms(t0),
+            reviewer_id=reviewer,
+            revision=revision,
+        )
+        return {
+            "edit_confirmed": confirmed,
             "human_feedback": feedback or None,
             "reviewer_id": reviewer,
         }
@@ -686,11 +974,18 @@ class Agent:
                 execution_time_ms=self.clock.elapsed_ms(t0),
                 reviewer_id=state.get("reviewer_id"),
             )
-            return {"final_action": "rejected"}
+            return {
+                "final_action": "rejected",
+                "post_status": "rejected",
+                "audit_error": self.audit_error,
+            }
 
         body = build_comment_body(state)
-        if self.dry_run:
-            console.print("  [yellow]·[/yellow] dry-run: comment NOT posted to GitHub")
+        if self.effective_dry_run(state):
+            console.print(
+                "  [yellow]·[/yellow] dry-run: comment NOT posted to GitHub "
+                f"[dim]({self.dry_run_origin(state)})[/dim]"
+            )
             await self.audit(
                 state,
                 action="commit",
@@ -700,47 +995,18 @@ class Agent:
                 # on `decision` must not read this as a posted review.
                 decision="dry_run",
                 status="done",
-                reason=f"dry-run: {len(body)} chars would be posted",
+                reason=f"dry-run ({self.dry_run_origin(state)}): {len(body)} chars would be posted",
                 execution_time_ms=self.clock.elapsed_ms(t0),
                 reviewer_id=state.get("reviewer_id"),
             )
-            return {"final_action": "committed_dry_run", "posted_comment_body": body}
+            return {
+                "final_action": "committed_dry_run",
+                "posted_comment_body": body,
+                "post_status": "dry_run",
+                "audit_error": self.audit_error,
+            }
 
-        try:
-            posted_url = await asyncio.to_thread(
-                self.github.post_review_comment,
-                state["pr_url"],
-                body,
-                thread_id=state.get("thread_id", ""),
-            )
-        except GitHubError as exc:
-            console.print(f"  [red]✗[/red] post failed: {exc.friendly}")
-            await self.audit(
-                state,
-                action="commit",
-                confidence=analysis.confidence,
-                risk_level=audit_risk_level(analysis),
-                decision="failed",
-                status="failed",
-                reason=exc.friendly,
-                execution_time_ms=self.clock.elapsed_ms(t0),
-                reviewer_id=state.get("reviewer_id"),
-            )
-            return {"final_action": "commit_failed", "post_error": exc.friendly}
-
-        console.print(f"  [green]✓[/green] posted comment to {state['pr_url']}")
-        await self.audit(
-            state,
-            action="commit",
-            confidence=analysis.confidence,
-            risk_level=audit_risk_level(analysis),
-            decision="committed",
-            status="done",
-            reason=f"Posted top-level PR comment ({posted_url})",
-            execution_time_ms=self.clock.elapsed_ms(t0),
-            reviewer_id=state.get("reviewer_id"),
-        )
-        return {"final_action": "committed", "posted_comment_body": body}
+        return await self._post(state, body, analysis, t0, action="commit", auto=False)
 
     async def node_auto_approve(self, state: ReviewState) -> dict:
         """High confidence, no human — post directly (still via `commit` shape)."""
@@ -760,11 +1026,18 @@ class Agent:
                 reason="Refused auto-approval: security or blocker finding present",
                 execution_time_ms=self.clock.elapsed_ms(t0),
             )
-            return {"final_action": "auto_refused_security"}
+            return {
+                "final_action": "auto_refused_security",
+                "post_status": "failed",
+                "audit_error": self.audit_error,
+            }
 
         body = build_comment_body(state)
-        if self.dry_run:
-            console.print("  [yellow]·[/yellow] dry-run: comment NOT posted to GitHub")
+        if self.effective_dry_run(state):
+            console.print(
+                "  [yellow]·[/yellow] dry-run: comment NOT posted to GitHub "
+                f"[dim]({self.dry_run_origin(state)})[/dim]"
+            )
             await self.audit(
                 state,
                 action="auto_approve",
@@ -772,13 +1045,45 @@ class Agent:
                 risk_level="low",
                 decision="dry_run",  # not "auto": nothing reached GitHub
                 status="done",
-                reason=f"dry-run: {len(body)} chars would be posted",
+                reason=f"dry-run ({self.dry_run_origin(state)}): {len(body)} chars would be posted",
                 execution_time_ms=self.clock.elapsed_ms(t0),
             )
-            return {"final_action": "auto_approved_dry_run", "posted_comment_body": body}
+            return {
+                "final_action": "auto_approved_dry_run",
+                "posted_comment_body": body,
+                "post_status": "dry_run",
+                "audit_error": self.audit_error,
+            }
+
+        return await self._post(state, body, analysis, t0, action="auto_approve", auto=True)
+
+    async def _post(
+        self,
+        state: ReviewState,
+        body: str,
+        analysis: PRAnalysis,
+        t0: float,
+        *,
+        action: str,
+        auto: bool,
+    ) -> dict:
+        """Perform the one POST this graph is allowed to make, and report honestly.
+
+        Maps :class:`~common.github.PostResult` onto a final action:
+
+        * ``posted``          → success
+        * ``already_posted``  → success (the review IS on the PR, from an earlier
+          attempt); reported distinctly so a retry is visible
+        * ``unconfirmed``     → neither success nor failure; GitHub may or may not
+          have created the comment, so automation must not assume either
+        * ``GitHubError``     → definitive failure (401/403/404/429/422)
+        """
+        prefix = "auto_approve" if auto else "commit"
+        risk = "low" if auto else audit_risk_level(analysis)
+        reviewer = None if auto else state.get("reviewer_id")
 
         try:
-            posted_url = await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 self.github.post_review_comment,
                 state["pr_url"],
                 body,
@@ -788,72 +1093,152 @@ class Agent:
             console.print(f"  [red]✗[/red] post failed: {exc.friendly}")
             await self.audit(
                 state,
-                action="auto_approve",
+                action=prefix,
                 confidence=analysis.confidence,
-                risk_level="low",
+                risk_level=risk,
                 decision="failed",
                 status="failed",
                 reason=exc.friendly,
                 execution_time_ms=self.clock.elapsed_ms(t0),
+                reviewer_id=reviewer,
             )
-            return {"final_action": "auto_approve_failed", "post_error": exc.friendly}
+            return {
+                "final_action": f"{prefix}_failed",
+                "post_error": exc.friendly,
+                "post_status": "failed",
+                "audit_error": self.audit_error,
+            }
 
-        console.print(f"  [green]✓[/green] posted comment to {state['pr_url']}")
+        if result.status == PostStatus.UNCONFIRMED:
+            console.print(
+                "  [yellow]![/yellow] GitHub accepted the request but the outcome "
+                "could not be confirmed — NOT retried"
+            )
+            await self.audit(
+                state,
+                action=prefix,
+                confidence=analysis.confidence,
+                risk_level=risk,
+                decision="unconfirmed",
+                status="failed",
+                reason=result.detail,
+                execution_time_ms=self.clock.elapsed_ms(t0),
+                reviewer_id=reviewer,
+            )
+            return {
+                "final_action": "commit_unconfirmed",
+                "post_error": result.detail,
+                "post_status": "unconfirmed",
+                "audit_error": self.audit_error,
+            }
+
+        already = result.status == PostStatus.ALREADY_POSTED
+        if already:
+            console.print(
+                f"  [green]✓[/green] review already on {state['pr_url']} "
+                "(earlier attempt) — not posted again"
+            )
+            decision = "committed"
+            reason = f"Already on the PR, not re-posted ({result.detail})"
+        else:
+            console.print(f"  [green]✓[/green] posted comment to {state['pr_url']}")
+            decision = "auto" if auto else "committed"
+            reason = f"Posted top-level PR comment ({result.comment_url})"
+
         await self.audit(
             state,
-            action="auto_approve",
+            action=prefix,
             confidence=analysis.confidence,
-            risk_level="low",
-            decision="auto",
+            risk_level=risk,
+            decision=decision,
             status="done",
-            reason=f"Auto-posted top-level PR comment ({posted_url})",
+            reason=reason,
             execution_time_ms=self.clock.elapsed_ms(t0),
+            reviewer_id=reviewer,
         )
-        return {"final_action": "auto_approved", "posted_comment_body": body}
+        final_action = (
+            "auto_approved" if auto else ("committed_already" if already else "committed")
+        )
+        return {
+            "final_action": final_action,
+            "posted_comment_body": body,
+            "post_status": "already_posted" if already else "posted",
+            "audit_error": self.audit_error,
+        }
 
     # -- plumbing ----------------------------------------------------------
     def _posting_allowed(self, state: ReviewState) -> tuple[bool, str]:
-        """Decide whether `commit` may post, and why not when it may not."""
+        """Decide whether `commit` may post, and why not when it may not.
+
+        Exactly one human decision authorises a post, whichever path got here:
+
+        * escalation answered **and** confirmed (when the mode has that gate), or
+        * the reviewer approved the original review, or
+        * the reviewer confirmed the review produced by the Edit loop.
+        """
         if state.get("refined") is False or state.get("analysis_error"):
-            return False, "refined analysis unavailable"
+            return False, "reviewed analysis unavailable"
         if state.get("escalation_answers"):
             if self.mode.has_final_confirmation and not state.get("refine_confirmed"):
                 return False, "reviewer did not confirm posting after escalation"
             return True, ""
+        if state.get("edit_revision"):
+            # The Edit loop was entered: it is the edit confirmation that counts,
+            # not the original `edit` choice.
+            if state.get("edit_confirmed") is True:
+                return True, ""
+            return False, "reviewer did not confirm the edited review"
         if state.get("human_choice") == "approve":
             return True, ""
+        if state.get("human_choice") == "edit":
+            return False, "reviewer chose edit but no confirmed revision exists"
         return False, f"human chose {state.get('human_choice') or 'nothing'}"
 
     async def node_fetch_failed(self, state: ReviewState) -> dict:
         console.print("[red]✗ aborting: PR could not be fetched[/red]")
-        return {"final_action": "fetch_failed"}
+        return {
+            "final_action": "fetch_failed",
+            "post_status": "failed",
+            "audit_error": self.audit_error,
+        }
 
     async def node_analyze_failed(self, state: ReviewState) -> dict:
         console.print("[red]✗ aborting: analysis failed — nothing was posted[/red]")
-        return {"final_action": "analyze_failed"}
+        return {
+            "final_action": "analyze_failed",
+            "post_status": "failed",
+            "audit_error": self.audit_error,
+        }
 
 
 def _reinstate_blockers(refined: PRAnalysis, initial: PRAnalysis) -> PRAnalysis:
-    """Put back any blocker finding the refined analysis no longer reports.
+    """Put back any blocker finding the newer analysis no longer reports.
 
     Resolution is judged by *location* (file + line): a blocker at ``file:line``
-    counts as resolved only when the refined review still reports a blocker
-    there. Softening it to a "suggestion" — or replacing it with a different
-    concern at the same spot — is not evidence that the risk went away, and the
-    lab explicitly requires an unresolved security risk to survive escalation.
+    counts as resolved only when the new review still reports a blocker there.
+    Softening it to a "suggestion" — or replacing it with a different concern at
+    the same spot — is not evidence that the risk went away.
+
+    Used by both rewrite paths, because the same rule has to hold whether the
+    second pass came from the reviewer's escalation answers or from their Edit
+    instructions: a human request cannot silently delete a security blocker.
     """
-    refined_blocker_locations = {
+    new_blocker_locations = {
         (c.file, c.line) for c in refined.comments if c.severity == "blocker"
     }
     restored = [
         c
         for c in initial.comments
-        if c.severity == "blocker" and (c.file, c.line) not in refined_blocker_locations
+        if c.severity == "blocker" and (c.file, c.line) not in new_blocker_locations
     ]
     risks = list(dict.fromkeys([*refined.risk_factors, *initial.risk_factors]))
     return refined.model_copy(
         update={"comments": [*refined.comments, *restored], "risk_factors": risks}
     )
+
+
+#: The Edit loop applies the same blocker-retention rule as synthesis.
+_keep_blockers_revised = _reinstate_blockers
 
 
 # ─── graph ────────────────────────────────────────────────────────────────
@@ -867,7 +1252,7 @@ def build_graph(
     github: GitHubService | None = None,
     audit_sink: AuditSink | None = None,
     clock: _Clock | None = None,
-    dry_run: bool = False,
+    dry_run: bool | None = False,
 ):
     """Compile the graph for ``mode``.
 
@@ -875,6 +1260,12 @@ def build_graph(
     one). When omitted, a :class:`~langgraph.checkpoint.memory.MemorySaver` is
     used — that is exercise 2's configuration; exercises 4–5 pass in an
     ``AsyncSqliteSaver`` so checkpoints survive a restart.
+
+    ``dry_run`` is only a **fallback** for callers that never seed the graph
+    state: the authoritative value is ``state["dry_run"]``, which the entry points
+    persist when the session starts. Pass ``None`` to mean "trust the state, and
+    refuse to post when the checkpoint does not record a mode" (the safe answer
+    for a resumed, older thread). See :meth:`Agent.effective_dry_run`.
     """
     mode = Mode(mode)
     agent = Agent(
@@ -938,8 +1329,29 @@ def build_graph(
         },
     )
     g.add_edge("auto_approve", END)
-    g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
+
+    # ── the Edit loop ─────────────────────────────────────────────────────
+    # human_approval --edit--> edit_review --> final_edit_approval --confirm--> commit
+    #                                              |  ^                     |
+    #                                     reject --+  +--edit again---------+
+    # A bare `edit` choice must NOT end the graph (it used to resolve to
+    # "rejected") and must not post anything on its own.
+    g.add_node("edit_review", agent.node_edit_review)
+    g.add_node("final_edit_approval", agent.node_final_edit_approval)
+    g.add_conditional_edges(
+        "human_approval",
+        lambda s: "edit_review" if s.get("human_choice") == "edit" else "commit",
+        {"edit_review": "edit_review", "commit": "commit"},
+    )
+    g.add_edge("edit_review", "final_edit_approval")
+    g.add_conditional_edges(
+        "final_edit_approval",
+        lambda s: "edit_review"
+        if s.get("edit_confirmed") is None
+        else "commit",
+        {"edit_review": "edit_review", "commit": "commit"},
+    )
 
     # `escalate` uses the real Q&A node in every HITL mode (the reviewer answers
     # specific questions) and `synthesize` refines the review with those answers.
@@ -983,6 +1395,8 @@ __all__ = [
     "LLMBinding",
     "LLMFactory",
     "Mode",
+    "PostResult",
+    "PostStatus",
     "RealGitHubService",
     "RealLLMFactory",
     "build_comment_body",

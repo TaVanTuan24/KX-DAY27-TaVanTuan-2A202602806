@@ -138,6 +138,216 @@ async def test_schema_has_the_idempotency_index(audit_db) -> None:
         assert column in row["sql"]
 
 
+# ─── PHASE 4: a new Edit round must not look like a duplicate ──────────────
+#
+# The unique key is (thread_id, action, status, decision, revision). Without the
+# `revision` component, a second Edit round in the SAME thread produces the same
+# (action, status, decision) as the first and would be dropped — losing a real
+# human decision from the trail.
+
+
+def test_legacy_index_is_rebuilt_with_the_revision_column(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An old 4-column index must be widened, not silently reused."""
+    import asyncio
+
+    db = tmp_path / "old-index.db"
+    monkeypatch.setenv("HITL_DB_PATH", str(db))
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        CREATE TABLE audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            thread_id TEXT NOT NULL, pr_url TEXT NOT NULL, agent_id TEXT NOT NULL,
+            action TEXT NOT NULL, confidence REAL NOT NULL, risk_level TEXT NOT NULL,
+            reviewer_id TEXT, decision TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            reason TEXT, execution_time_ms INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX audit_events_idempotency_idx
+            ON audit_events (thread_id, action, status, decision);
+        """
+    )
+    con.execute(
+        "INSERT INTO audit_events (timestamp, thread_id, pr_url, agent_id, action,"
+        " confidence, risk_level, decision, status, reason, execution_time_ms)"
+        " VALUES ('2026-01-01T00:00:00Z','t1','u','a','human_approval',0.6,'med',"
+        "'edit','responded','first edit',1)"
+    )
+    con.commit()
+    con.close()
+
+    async def migrate():
+        async with db_conn() as conn:
+            async with conn.execute("PRAGMA table_info(audit_events)") as cur:
+                columns = {row[1] for row in await cur.fetchall()}
+            async with conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='audit_events_idempotency_idx'"
+            ) as cur:
+                index_sql = (await cur.fetchone())["sql"]
+            async with conn.execute("SELECT COUNT(*) AS n FROM audit_events") as cur:
+                rows = (await cur.fetchone())["n"]
+        return columns, index_sql, rows
+
+    columns, index_sql, rows = asyncio.run(migrate())
+    assert "revision" in columns
+    assert "revision" in index_sql, "the index must include the revision column"
+    assert rows == 1, "valid history must be preserved"
+
+
+async def test_write_audit_event_reports_whether_it_wrote(audit_db) -> None:
+    entry = AuditEntry(
+        agent_id="a", action="edit_review", confidence=0.6, risk_level="med",
+        decision="edit", status="done", revision=1, reason="r1", execution_time_ms=1,
+    )
+    assert await write_audit_event(thread_id="t1", pr_url="u", entry=entry) is True
+    # An identical repeat is an ignored duplicate, not a write.
+    assert await write_audit_event(thread_id="t1", pr_url="u", entry=entry) is False
+
+
+async def test_two_edit_rounds_are_both_recorded(audit_db) -> None:
+    """The same (action, status, decision) in a NEW revision is kept."""
+    for revision in (1, 2):
+        await write_audit_event(
+            thread_id="t1", pr_url="u",
+            entry=AuditEntry(
+                agent_id="a", action="edit_review", confidence=0.6, risk_level="med",
+                decision="edit", status="done", revision=revision,
+                reason=f"revision {revision}", execution_time_ms=1,
+            ),
+        )
+    events = await replay_events("t1")
+    assert [e["revision"] for e in events] == [1, 2]
+    assert [e["reason"] for e in events] == ["revision 1", "revision 2"]
+
+
+async def test_the_same_revision_replayed_is_still_deduplicated(audit_db) -> None:
+    """...while an exact replay of one round is not stored twice."""
+    entry = AuditEntry(
+        agent_id="a", action="final_edit_approval", confidence=0.6, risk_level="med",
+        decision="pending", status="waiting", revision=3, reason="confirm?", execution_time_ms=1,
+    )
+    for _ in range(3):
+        await write_audit_event(thread_id="t1", pr_url="u", entry=entry)
+    assert len(await replay_events("t1")) == 1
+
+
+async def test_replay_output_distinguishes_revisions(audit_db) -> None:
+    """The `--thread` view must show which revision an event belongs to."""
+    import io
+
+    from rich.console import Console
+
+    from audit import replay as replay_module
+
+    for revision, reason in ((1, "first pass"), (2, "second pass")):
+        await write_audit_event(
+            thread_id="t1", pr_url="u",
+            entry=AuditEntry(
+                agent_id="a", action="edit_review", confidence=0.6, risk_level="med",
+                decision="edit", status="done", revision=revision,
+                reason=reason, execution_time_ms=1,
+            ),
+        )
+
+    buffer = io.StringIO()
+    original = replay_module.console
+    replay_module.console = Console(file=buffer, width=200, force_terminal=False)
+    try:
+        await replay_module.replay("t1")
+    finally:
+        replay_module.console = original
+
+    output = buffer.getvalue()
+    assert "rev=" in output
+    assert "first pass" in output and "second pass" in output
+
+
+async def test_replay_list_still_works_with_revisions(audit_db) -> None:
+    import io
+
+    from rich.console import Console
+
+    from audit import replay as replay_module
+
+    await write_audit_event(
+        thread_id="t1", pr_url="u",
+        entry=AuditEntry(
+            agent_id="a", action="edit_review", confidence=0.6, risk_level="med",
+            decision="edit", status="done", revision=2, reason="r", execution_time_ms=1,
+        ),
+    )
+    buffer = io.StringIO()
+    original = replay_module.console
+    replay_module.console = Console(file=buffer, width=200, force_terminal=False)
+    try:
+        await replay_module.list_threads()
+    finally:
+        replay_module.console = original
+    assert "t1" in buffer.getvalue()
+
+
+async def test_audit_failure_is_surfaced_not_swallowed() -> None:
+    """A mode that promises an audit trail must not report success without one."""
+    from exercises.agent import Agent, Mode
+
+    async def exploding_sink(state, entry):
+        raise RuntimeError("disk full")
+
+    agent = Agent(
+        mode=Mode.EXERCISE_4,
+        llm_factory=FakeLLMFactory(),
+        github=FakeGitHub(),
+        audit_sink=exploding_sink,
+    )
+    await agent.audit(
+        {"thread_id": "t", "pr_url": "u"},
+        action="commit",
+        confidence=0.9,
+        risk_level="low",
+        decision="committed",
+    )
+    assert agent.audit_error and "disk full" in agent.audit_error
+
+
+async def test_a_successful_audit_clears_a_previous_failure() -> None:
+    from exercises.agent import Agent, Mode
+
+    written: list[str] = []
+
+    async def flaky_sink(state, entry):
+        if entry.action == "first":
+            raise RuntimeError("transient")
+        written.append(entry.action)
+
+    agent = Agent(
+        mode=Mode.EXERCISE_4,
+        llm_factory=FakeLLMFactory(),
+        github=FakeGitHub(),
+        audit_sink=flaky_sink,
+    )
+    await agent.audit(
+        {"thread_id": "t", "pr_url": "u"},
+        action="first",
+        confidence=0.9,
+        risk_level="low",
+        decision="pending",
+    )
+    assert agent.audit_error is not None
+
+    await agent.audit(
+        {"thread_id": "t", "pr_url": "u"},
+        action="second",
+        confidence=0.9,
+        risk_level="low",
+        decision="pending",
+    )
+    assert agent.audit_error is None
+    assert written == ["second"]
+
+
 def test_legacy_database_is_migrated_and_deduplicated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

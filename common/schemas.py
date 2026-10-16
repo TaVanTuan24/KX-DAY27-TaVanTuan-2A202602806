@@ -20,6 +20,8 @@ AuditAction = Literal[
     "route",
     "auto_approve",
     "human_approval",
+    "edit_review",
+    "final_edit_approval",
     "escalate",
     "synthesize",
     "final_approval",
@@ -27,11 +29,15 @@ AuditAction = Literal[
 ]
 
 #: Decisions accepted by ``audit_events.decision``.
-#: ``dry_run`` exists so a rehearsal never claims a comment was posted.
+#: * ``dry_run`` — a rehearsal; never read as a posted comment.
+#: * ``unconfirmed`` — the POST may or may not have been applied by GitHub.
 AuditDecision = Literal[
     "auto", "approve", "reject", "edit", "escalate", "pending",
-    "committed", "failed", "dry_run",
+    "committed", "failed", "dry_run", "unconfirmed",
 ]
+
+#: Outcome of an attempted GitHub POST (mirrors common.github.PostStatus).
+PostOutcome = Literal["posted", "already_posted", "unconfirmed", "failed", "dry_run"]
 
 #: Lifecycle phase accepted by ``audit_events.status``.
 AuditStatus = Literal[
@@ -309,15 +315,22 @@ class AuditEntry(BaseModel):
     decision: str = Field(
         description="Outcome at this step — "
                     "'auto' | 'approve' | 'reject' | 'edit' | 'escalate' | "
-                    "'pending' | 'committed' | 'failed'.",
+                    "'pending' | 'committed' | 'failed' | 'dry_run' | 'unconfirmed'.",
     )
     status: str = Field(
         default="pending",
         description="Lifecycle phase of this event — "
-                    "'pending' | 'waiting' | 'responded' | 'done' | 'failed'. "
-                    "Together with (thread_id, action) it forms the UNIQUE "
-                    "idempotency key that keeps re-executed nodes from writing "
-                    "duplicate audit rows.",
+                    "'pending' | 'waiting' | 'responded' | 'done' | 'failed'.",
+    )
+    revision: int = Field(
+        default=0,
+        ge=0,
+        description="Which review revision this event belongs to. The Edit loop can "
+                    "produce several human_approval/edit_review rounds in ONE thread; "
+                    "together with (thread_id, action, status, decision) it forms the "
+                    "UNIQUE idempotency key, so an identical replay of the *same* "
+                    "round collapses while a genuinely new round is recorded "
+                    "separately.",
     )
     reason: str | None = Field(
         default=None,
@@ -336,6 +349,9 @@ class ReviewState(TypedDict, total=False):
     # Inputs
     pr_url: str
     thread_id: str
+    #: Persisted at session start and afterwards the ONLY source of truth for
+    #: whether this review may touch GitHub. A resume must never override it.
+    dry_run: bool
 
     # Populated by fetch_pr
     pr_title: str
@@ -357,15 +373,30 @@ class ReviewState(TypedDict, total=False):
     escalation_answers: dict[str, str] | None
     reviewer_id: str | None
 
+    # Populated by the Edit loop (human_approval --edit--> edit_review --> final_edit_approval)
+    edit_revision: int
+    #: Instructions the reviewer typed for the LLM to apply.
+    edit_instructions: str | None
+    #: Review body the reviewer wrote/replaced *verbatim*. When set it is
+    #: human-authored content: the LLM must not overwrite it and it is what gets
+    #: posted.
+    edited_comment_body: str | None
+    #: Confirmation of the edited review (None until final_edit_approval answers).
+    edit_confirmed: bool | None
+
     # Populated by final_approval (post-escalation confirmation)
     refine_confirmed: bool | None
 
     # Populated by commit / final nodes
     posted_comment_body: str | None
     final_action: str | None
+    #: "posted" | "already_posted" | "unconfirmed" | "failed" | "dry_run"
+    post_status: str | None
 
     # Error channels — used by the failure nodes (nothing is posted when set)
     fetch_error: str | None
     analysis_error: str | None
     post_error: str | None
+    #: Set when an audit write failed in a mode that must keep an audit trail.
+    audit_error: str | None
     refined: bool | None

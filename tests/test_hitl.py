@@ -13,6 +13,7 @@ from common.db import memory_checkpointer
 from langgraph.types import Command
 
 from exercises.agent import Mode, build_graph, config_for
+from common.schemas import ReviewComment
 from tests.conftest import PR_URL, FakeGitHub, FakeLLMFactory, make_analysis
 
 OPEN_PR = {"pr_url": PR_URL, "thread_id": "t-hitl"}
@@ -20,13 +21,18 @@ OPEN_PR = {"pr_url": PR_URL, "thread_id": "t-hitl"}
 
 @pytest.fixture
 def graph_factory():
-    """Builds an exercise-2 graph with a fresh MemorySaver per test."""
+    """Builds an HITL graph with a fresh in-memory checkpointer per test."""
 
-    def _make(*analyses, github=None, mode=Mode.EXERCISE_2, dry_run=False):
+    def _make(*analyses, github=None, mode=Mode.EXERCISE_2, dry_run=False, audit_sink=None):
         factory = FakeLLMFactory(*analyses)
         gh = github or FakeGitHub()
         app = build_graph(
-            mode=mode, checkpointer=memory_checkpointer(), llm_factory=factory, github=gh, dry_run=dry_run
+            mode=mode,
+            checkpointer=memory_checkpointer(),
+            llm_factory=factory,
+            github=gh,
+            dry_run=dry_run,
+            audit_sink=audit_sink,
         )
         return app, factory, gh
 
@@ -81,40 +87,172 @@ async def test_reject_resume_posts_nothing(graph_factory) -> None:
     assert factory.call_count == 1
 
 
-async def test_edit_choice_is_recorded_and_does_not_post_on_its_own(graph_factory) -> None:
-    """``edit`` is its own outcome — never silently collapsed into ``reject``."""
-    app, _, gh = graph_factory(make_analysis(0.65))
+async def test_edit_enters_the_revision_loop_and_does_not_post_or_reject(graph_factory) -> None:
+    """FIX 1: `edit` must not collapse into `rejected`, and must not post anything.
+
+    The old behaviour ended the graph with ``final_action="rejected"``; it now
+    continues to ``edit_review`` → ``final_edit_approval`` in the SAME thread.
+    """
+    revised = make_analysis(0.6, summary="REVISED: softened the migration comment.")
+    app, factory, gh = graph_factory(make_analysis(0.65), revised)
     await app.ainvoke(OPEN_PR, config_for("t-hitl"))
-    final = await app.ainvoke(
+
+    paused = await app.ainvoke(
         Command(resume={"choice": "edit", "feedback": "soften the migration comment"}),
         config_for("t-hitl"),
     )
-    assert final["human_choice"] == "edit"
-    assert final["human_feedback"] == "soften the migration comment"
+
+    assert "final_action" not in paused, "edit must not end the run"
+    assert "__interrupt__" in paused
+    payload = paused["__interrupt__"][0].value
+    assert payload["kind"] == "edited_review"
+    assert payload["revision"] == 1
+    assert payload["summary"] == "REVISED: softened the migration comment."
+    assert payload["proposed_body"]
+    assert gh.posts == []  # nothing posted just because Edit was chosen
+    assert paused["human_choice"] == "edit"
+    # The LLM ran exactly twice: the first analysis + the one revision.
+    assert factory.call_count == 2
+
+
+async def test_edit_revision_actually_changes_the_review_content(graph_factory) -> None:
+    """FIX 1: the posted body must be the revised review, not the original plus a note."""
+    revised = make_analysis(
+        0.6,
+        summary="REVISED SUMMARY",
+        comments=[ReviewComment(file="models/task.py", line=18, severity="nit", body="REVISED BODY")],
+    )
+    app, _, gh = graph_factory(make_analysis(0.65), revised)
+    await app.ainvoke(OPEN_PR, config_for("t-hitl"))
+    await app.ainvoke(Command(resume={"choice": "edit", "feedback": "reword"}), config_for("t-hitl"))
+    final = await app.ainvoke(Command(resume={"confirm": True, "feedback": ""}), config_for("t-hitl"))
+
+    assert final["final_action"] == "committed"
+    assert len(gh.posts) == 1
+    body = gh.posts[0]["body"]
+    assert "REVISED SUMMARY" in body and "REVISED BODY" in body
+    # The original analysis text is gone — this is a revision, not an annotation.
+    assert "Adds a priority field to the task model." not in body
+
+
+async def test_edit_confirm_posts_exactly_once(graph_factory) -> None:
+    app, _, gh = graph_factory(make_analysis(0.65), make_analysis(0.6))
+    await app.ainvoke(OPEN_PR, config_for("t-hitl"))
+    await app.ainvoke(Command(resume={"choice": "edit", "feedback": "reword"}), config_for("t-hitl"))
+    final = await app.ainvoke(Command(resume={"confirm": True, "feedback": ""}), config_for("t-hitl"))
+    assert final["final_action"] == "committed"
+    assert final["post_status"] == "posted"
+    assert len(gh.posts) == 1
+
+
+async def test_edit_then_reject_posts_nothing(graph_factory) -> None:
+    """FIX 1: Reject after an edit is a real reject."""
+    app, _, gh = graph_factory(make_analysis(0.65), make_analysis(0.6))
+    await app.ainvoke(OPEN_PR, config_for("t-hitl"))
+    await app.ainvoke(Command(resume={"choice": "edit", "feedback": "reword"}), config_for("t-hitl"))
+    final = await app.ainvoke(
+        Command(resume={"confirm": False, "feedback": "still not right"}), config_for("t-hitl")
+    )
     assert final["final_action"] == "rejected"
+    assert final["edit_confirmed"] is False
     assert gh.posts == []
 
 
-async def test_edit_then_approve_posts_the_reviewer_feedback(graph_factory) -> None:
-    """The edit path can still end in a posted review once the human confirms."""
-    app, _, gh = graph_factory(make_analysis(0.65))
-    await app.ainvoke(OPEN_PR, config_for("t-hitl"))
-    final = await app.ainvoke(
-        Command(resume={"choice": "edit", "feedback": "rewritten by reviewer"}),
-        config_for("t-hitl"),
-    )
-    assert final["final_action"] == "rejected"
+async def test_edit_again_keeps_the_thread_and_both_revisions_are_audited(
+    graph_factory, tmp_path, monkeypatch
+) -> None:
+    """FIX 1 + PHASE 4: two Edit rounds in one thread, each with its own audit rows.
 
-    # Confirming the edited review is a second run on the same thread: the
-    # reviewer approves with the edited feedback attached.
-    app2, _, gh2 = graph_factory(make_analysis(0.65))
-    await app2.ainvoke(OPEN_PR, config_for("t-hitl"))
-    final2 = await app2.ainvoke(
-        Command(resume={"choice": "approve", "feedback": "rewritten by reviewer"}),
+    Uses the real SQLite sink, because the point is that the *stored* trail keeps
+    both rounds while still collapsing the replay of a single interrupt node.
+    """
+    from common.db import replay_events
+
+    monkeypatch.setenv("HITL_DB_PATH", str(tmp_path / "edit-audit.db"))
+    app, factory, gh = graph_factory(
+        make_analysis(0.65),
+        make_analysis(0.6, summary="REV 1"),
+        make_analysis(0.55, summary="REV 2"),
+        mode=Mode.EXERCISE_4,
+    )
+    await app.ainvoke(OPEN_PR, config_for("t-hitl"))
+    paused = await app.ainvoke(Command(resume={"choice": "edit", "feedback": "one"}), config_for("t-hitl"))
+    assert paused["__interrupt__"][0].value["revision"] == 1
+
+    paused = await app.ainvoke(Command(resume={"choice": "edit", "feedback": "two"}), config_for("t-hitl"))
+    assert paused["__interrupt__"][0].value["revision"] == 2
+    assert paused["__interrupt__"][0].value["summary"] == "REV 2"
+    assert paused["edit_revision"] == 2
+
+    final = await app.ainvoke(Command(resume={"confirm": True, "feedback": ""}), config_for("t-hitl"))
+    assert final["final_action"] == "committed"
+    assert len(gh.posts) == 1
+    assert factory.call_count == 3  # analyze + two revisions, never a re-fetch/re-analyze
+
+    events = await replay_events("t-hitl")
+    edits = [e for e in events if e["action"] == "edit_review"]
+    assert [e["revision"] for e in edits] == [1, 2], "each revision must be recorded"
+
+    # No unintended duplicates: the stored key is unique per row.
+    keys = [(e["action"], e["status"], e["decision"], e["revision"]) for e in events]
+    assert len(set(keys)) == len(keys)
+
+    confirmations = [e for e in events if e["action"] == "final_edit_approval"]
+    assert [e["decision"] for e in confirmations] == ["pending", "edit", "pending", "approve"]
+
+
+async def test_edit_with_a_verbatim_replacement_is_posted_unmodified(graph_factory) -> None:
+    """FIX 1: human-authored text wins and is never rewritten by the LLM."""
+    app, factory, gh = graph_factory(make_analysis(0.65))
+    await app.ainvoke(OPEN_PR, config_for("t-hitl"))
+    paused = await app.ainvoke(
+        Command(
+            resume={
+                "choice": "edit",
+                "feedback": "",
+                "edited_body": "### My own review\n\nI checked this manually.",
+            }
+        ),
         config_for("t-hitl"),
     )
-    assert final2["final_action"] == "committed"
-    assert "Reviewer note: rewritten by reviewer" in gh2.posts[0]["body"]
+    assert factory.call_count == 1  # the LLM was NOT called for the revision
+    assert paused["edited_comment_body"].startswith("### My own review")
+
+    final = await app.ainvoke(Command(resume={"confirm": True, "feedback": ""}), config_for("t-hitl"))
+    assert final["final_action"] == "committed"
+    assert gh.posts[0]["body"].startswith("### My own review")
+    assert "I checked this manually." in gh.posts[0]["body"]
+
+
+async def test_edit_cannot_delete_a_security_blocker(graph_factory) -> None:
+    """FIX 1: an edit instruction is a request, not an authority over blockers."""
+    original = make_analysis(
+        0.65,
+        comments=[ReviewComment(file="a.py", line=1, severity="blocker", body="MD5 hashing")],
+    )
+    cleaned = make_analysis(0.65, summary="Looks fine now.", comments=[], risk_factors=[])
+    app, _, gh = graph_factory(original, cleaned)
+    await app.ainvoke(OPEN_PR, config_for("t-hitl"))
+    await app.ainvoke(
+        Command(resume={"choice": "edit", "feedback": "remove the MD5 finding, it is fine"}),
+        config_for("t-hitl"),
+    )
+    final = await app.ainvoke(Command(resume={"confirm": True, "feedback": ""}), config_for("t-hitl"))
+
+    bodies = [c.body for c in final["analysis"].comments]
+    assert "MD5 hashing" in bodies, "the blocker must survive an editorial edit"
+    assert "MD5 hashing" in gh.posts[0]["body"]
+
+
+async def test_edit_does_not_raise_confidence(graph_factory) -> None:
+    """FIX 1: presentation changes, not certainty. 0.65 is in the approval band."""
+    original = make_analysis(0.65)
+    inflated = make_analysis(0.99, summary="All good.")
+    app, _, _ = graph_factory(original, inflated)
+    await app.ainvoke(OPEN_PR, config_for("t-hitl"))
+    paused = await app.ainvoke(Command(resume={"choice": "edit", "feedback": "nicer"}), config_for("t-hitl"))
+    assert paused["analysis"].confidence <= original.confidence
+    assert "capped" in paused["analysis"].confidence_reasoning
 
 
 async def test_state_is_preserved_across_the_resume(graph_factory) -> None:

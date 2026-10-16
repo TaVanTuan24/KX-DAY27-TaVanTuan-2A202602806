@@ -12,13 +12,17 @@ Turn the ``human_approval`` node from a placeholder into a real pause-and-ask:
   resumes with ``Command(resume=answer)`` **on the same thread_id**.
 
 ``approve`` → the comment is posted. ``reject`` → nothing is posted. ``edit`` →
-the reviewer's note is attached to the posted review; edit is never silently
-treated as a reject.
+the graph continues into the Edit loop (``edit_review`` →
+``final_edit_approval``) in the same thread, shows the revised review and only
+posts once the reviewer confirms it. Edit is never silently treated as a reject.
 
 The node bodies live in ``exercises/agent.py`` so exercises 1–5 share one
 implementation; this file is the exercise-2 view of that graph. The nodes are
 coroutines, so the graph is driven with the async API (``ainvoke``) — LangGraph
 does not provide a synchronous entry point for async nodes.
+
+Exit codes: 0 success (including a deliberate reject and a dry-run), 1 runtime /
+GitHub / LLM / unconfirmed-posting failure, 2 invalid URL, 130 Ctrl+C.
 
 Run:
     uv run python exercises/exercise_2_hitl.py --pr <PR URL> [--dry-run]
@@ -31,21 +35,33 @@ import asyncio
 import uuid
 
 from dotenv import load_dotenv
-from common.db import memory_checkpointer
 from langgraph.types import Command
 
+from common.db import memory_checkpointer
 from common.github import GitHubError, is_valid_pr_url
 from exercises.agent import Mode, build_graph, config_for, console
-from exercises.cli import handle_interrupt
+from exercises.cli import (
+    EXIT_BAD_INPUT,
+    EXIT_FAILURE,
+    EXIT_INTERRUPTED,
+    handle_interrupt,
+    report_exit,
+)
 
 
 async def run(pr_url: str, thread_id: str, *, dry_run: bool = False) -> dict:
-    app = build_graph(
-        mode=Mode.EXERCISE_2, checkpointer=memory_checkpointer(), dry_run=dry_run
-    )
+    """Drive the graph, seeding ``dry_run`` so a resume cannot change the mode.
+
+    The value is persisted in the graph state on the first invoke, and the graph
+    is built with ``dry_run=None`` so the *state* (not this caller) decides — see
+    ``Agent.effective_dry_run``.
+    """
+    app = build_graph(mode=Mode.EXERCISE_2, checkpointer=memory_checkpointer(), dry_run=None)
     cfg = config_for(thread_id)
 
-    result = await app.ainvoke({"pr_url": pr_url, "thread_id": thread_id}, cfg)
+    result = await app.ainvoke(
+        {"pr_url": pr_url, "thread_id": thread_id, "dry_run": dry_run}, cfg
+    )
     while "__interrupt__" in result:
         payload = result["__interrupt__"][0].value
         result = await app.ainvoke(Command(resume=handle_interrupt(payload)), cfg)
@@ -68,7 +84,7 @@ def main() -> None:
 
     if not is_valid_pr_url(args.pr):
         console.print(f"[red]✗ Not a GitHub PR URL:[/red] {args.pr}")
-        raise SystemExit(2)
+        raise SystemExit(EXIT_BAD_INPUT)
 
     console.rule("[bold]Exercise 2 — HITL with interrupt()[/bold]")
     console.print(f"[dim]PR: {args.pr}[/dim]\n")
@@ -77,8 +93,8 @@ def main() -> None:
     console.print(f"[dim]thread_id = {thread_id}[/dim]")
     if args.thread:
         console.print(
-            "[yellow]note[/yellow] exercise 2 uses MemorySaver: a checkpointer that lives "
-            "in this process only. In-process resumes work; a thread created by a "
+            "[yellow]note[/yellow] exercise 2 uses an in-process checkpointer "
+            "(MemorySaver): in-process resumes work, but a thread created by a "
             "*previous* process cannot be resumed here — use exercise 4 "
             "(AsyncSqliteSaver) for that."
         )
@@ -90,28 +106,23 @@ def main() -> None:
         result = asyncio.run(run(args.pr, thread_id, dry_run=args.dry_run))
     except GitHubError as exc:
         console.print(f"[red]✗ GitHub error:[/red] {exc.friendly}")
-        raise SystemExit(1) from exc
+        raise SystemExit(EXIT_FAILURE) from exc
     except KeyboardInterrupt:
         console.print(
             f"\n[yellow]Interrupted.[/yellow] Resume with:\n"
             f"  uv run python exercises/exercise_2_hitl.py --pr {args.pr} --thread {thread_id}"
         )
-        raise SystemExit(130)
+        raise SystemExit(EXIT_INTERRUPTED)
 
     console.rule("Done")
     console.print(f"thread_id    = {thread_id}")
     console.print(f"final_action = {result.get('final_action')}")
-    if result.get("fetch_error") or result.get("analysis_error"):
-        # The graph caught a provider/API failure and stopped before posting.
+    if result.get("post_status") == "unconfirmed":
         console.print(
-            f"[red]error[/red]        = {result.get('fetch_error') or result.get('analysis_error')}"
+            "[yellow]GitHub accepted the request but the outcome could not be "
+            "confirmed — the comment was NOT retried.[/yellow]"
         )
-        console.print("[red]Nothing was posted to GitHub.[/red]")
-        raise SystemExit(1)
-    if result.get("post_error"):
-        console.print(f"[red]error[/red]        = {result['post_error']}")
-        console.print("[red]GitHub rejected the comment — the run is NOT reported as posted.[/red]")
-        raise SystemExit(1)
+    raise SystemExit(report_exit(result))
 
 
 if __name__ == "__main__":

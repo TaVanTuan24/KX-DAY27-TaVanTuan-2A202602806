@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:  # make `common`, `audit`, `exercises`, `app` importable
     sys.path.insert(0, str(ROOT))
 
-from common.github import PullRequest, comment_marker  # noqa: E402
+from common.github import PostResult, PostStatus, PullRequest, comment_marker  # noqa: E402
 from common.schemas import PRAnalysis, ReviewComment  # noqa: E402
 
 PR_URL = "https://github.com/VinUni-AI20k/PR-Demo/pull/1"
@@ -144,7 +144,12 @@ class FakeLLMFactory:
 
 
 class FakeGitHub:
-    """In-memory ``GitHubService``: records posts instead of calling the API."""
+    """In-memory ``GitHubService``: records posts instead of calling the API.
+
+    A confirmed POST returns :attr:`PostStatus.POSTED`; set ``post_status`` to
+    exercise ``already_posted`` / ``unconfirmed`` and ``post_error`` for a
+    definitive failure.
+    """
 
     def __init__(
         self,
@@ -153,11 +158,13 @@ class FakeGitHub:
         fetch_error: Exception | None = None,
         post_error: Exception | None = None,
         reviewer: str | None = "octocat",
+        post_status: str = PostStatus.POSTED,
     ) -> None:
         self.pr = pr or make_pr()
         self.fetch_error = fetch_error
         self.post_error = post_error
         self.reviewer = reviewer
+        self.post_status = post_status
         self.posts: list[dict] = []
         self.fetches: list[str] = []
 
@@ -167,14 +174,55 @@ class FakeGitHub:
             raise self.fetch_error
         return self.pr
 
-    def post_review_comment(self, pr_url: str, body: str, *, thread_id: str = "") -> str:
+    def post_review_comment(self, pr_url: str, body: str, *, thread_id: str = "") -> PostResult:
         if self.post_error is not None:
             raise self.post_error
+        if self.post_status == PostStatus.UNCONFIRMED:
+            # Nothing is recorded: the caller must not treat this as posted.
+            return PostResult(
+                PostStatus.UNCONFIRMED,
+                attempts=1,
+                detail=(
+                    "simulated ambiguous outcome (timeout after the POST) — the thread "
+                    "marker is absent, so whether GitHub applied the POST is unknown; "
+                    "not retried"
+                ),
+            )
         self.posts.append({"pr_url": pr_url, "body": body, "thread_id": thread_id})
-        return f"https://github.com/example/comment/{len(self.posts)}"
+        if self.post_status == PostStatus.ALREADY_POSTED:
+            return PostResult(
+                PostStatus.ALREADY_POSTED,
+                comment_url="https://github.com/example/comment/existing",
+                attempts=0,
+                detail="simulated: the marker was already on the PR",
+                marker_found=True,
+            )
+        return PostResult(
+            PostStatus.POSTED,
+            comment_url=f"https://github.com/example/comment/{len(self.posts)}",
+            attempts=1,
+            detail="simulated: GitHub confirmed the comment (201)",
+        )
 
     def current_user(self) -> str | None:
         return self.reviewer
+
+
+@pytest.fixture(autouse=True)
+def _isolate_audit_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Give every test its own audit/checkpoint DB.
+
+    Audit-mode graphs (exercises 4–5) write through ``common.db.db_path()``, which
+    reads ``HITL_DB_PATH``. Without this an incidental test would write rows into
+    the developer's ``./hitl_audit.db`` — polluting real state and hiding the fact
+    that the test forgot to isolate itself.
+
+    Tests that need a specific path set ``HITL_DB_PATH`` themselves (an explicit or
+    in-body ``monkeypatch.setenv`` runs after this fixture and wins).
+    """
+    path = tmp_path / "isolated-audit.db"
+    monkeypatch.setenv("HITL_DB_PATH", str(path))
+    return path
 
 
 @pytest.fixture

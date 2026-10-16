@@ -41,10 +41,16 @@ from langgraph.types import Command
 from common.db import db_path, open_checkpointer
 from common.github import GitHubError, is_valid_pr_url
 from exercises.agent import Mode, build_graph, config_for, console
-from exercises.cli import handle_interrupt
+from exercises.cli import (
+    EXIT_BAD_INPUT,
+    EXIT_FAILURE,
+    EXIT_INTERRUPTED,
+    handle_interrupt,
+    report_exit,
+)
 
 
-async def run(pr_url: str, thread_id: str | None, *, dry_run: bool = False) -> None:
+async def run(pr_url: str, thread_id: str | None, *, dry_run: bool = False) -> dict:
     thread_id = thread_id or str(uuid.uuid4())
     console.rule("[bold]Exercise 4 — SQLite audit trail[/bold]")
     console.print(f"[dim]PR: {pr_url}[/dim]")
@@ -55,7 +61,10 @@ async def run(pr_url: str, thread_id: str | None, *, dry_run: bool = False) -> N
     console.print()
 
     async with open_checkpointer() as cp:
-        app = build_graph(mode=Mode.EXERCISE_4, checkpointer=cp, dry_run=dry_run)
+        # `dry_run=None`: the graph state is authoritative. A thread created before
+        # the mode was persisted has none, and then the agent fails safe (no POST)
+        # rather than trusting whatever this invocation was told.
+        app = build_graph(mode=Mode.EXERCISE_4, checkpointer=cp, dry_run=None)
 
         try:
             # Does this thread already exist (and is it still paused)? A finished
@@ -66,6 +75,11 @@ async def run(pr_url: str, thread_id: str | None, *, dry_run: bool = False) -> N
             pending = _pending_interrupts(snapshot)
             if pending:
                 console.print("[dim]resuming the checkpointed session…[/dim]")
+                if "dry_run" not in (snapshot.values or {}):
+                    console.print(
+                        "[yellow]![/yellow] this checkpoint does not record a "
+                        "dry-run mode — refusing to POST (fail-safe)."
+                    )
                 result = {"__interrupt__": pending}
             else:
                 if snapshot.values:
@@ -78,7 +92,7 @@ async def run(pr_url: str, thread_id: str | None, *, dry_run: bool = False) -> N
                     thread_id = str(uuid.uuid4())
                     console.print(f"[dim]thread_id = {thread_id}[/dim]")
                 result = await app.ainvoke(
-                    {"pr_url": pr_url, "thread_id": thread_id},
+                    {"pr_url": pr_url, "thread_id": thread_id, "dry_run": dry_run},
                     config_for(thread_id),
                 )
 
@@ -90,18 +104,19 @@ async def run(pr_url: str, thread_id: str | None, *, dry_run: bool = False) -> N
                 )
         except GitHubError as exc:
             console.print(f"[red]✗ GitHub error:[/red] {exc.friendly}")
-            raise SystemExit(1) from exc
+            raise SystemExit(EXIT_FAILURE) from exc
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted.[/yellow] State is checkpointed.")
             console.print(
                 f"  Resume: uv run python exercises/exercise_4_audit.py --pr {pr_url} "
                 f"--thread {thread_id}"
             )
-            raise SystemExit(130)
+            raise SystemExit(EXIT_INTERRUPTED)
 
         # Make sure the audit rows are flushed and readable before we print the
         # replay command.
         await _report(thread_id, result)
+        return result
 
 
 def _first_interrupt_payload(result: dict) -> dict:
@@ -136,20 +151,20 @@ async def _report(thread_id: str, result: dict) -> None:
         console.print(f"final confidence = {result['analysis'].confidence:.0%}")
     if result.get("post_error"):
         console.print(f"[red]post_error[/red]   = {result['post_error']}")
+    if result.get("post_status") == "unconfirmed":
+        console.print(
+            "[yellow]![/yellow] GitHub accepted the POST but the outcome could not be "
+            "confirmed — it was NOT retried, so the comment may or may not exist."
+        )
 
     events = await replay_events(thread_id)
     console.print(f"\n[bold]{len(events)} audit event(s) written[/bold]")
     for ev in events:
+        revision = f" rev={ev.get('revision', 0)}" if ev.get("revision") else ""
         console.print(
-            f"  [dim]{ev['timestamp']}[/dim] [cyan]{ev['action']:<15}[/cyan] "
+            f"  [dim]{ev['timestamp']}[/dim] [cyan]{ev['action']:<18}[/cyan] "
             f"conf={ev['confidence']:.2f} risk={ev['risk_level']:<4} "
-            f"decision={ev['decision']:<10} status={ev['status']}"
-        )
-
-    if result.get("fetch_error") or result.get("analysis_error") or result.get("post_error"):
-        console.print(
-            "[red]The run did not post a comment[/red] — see the audit trail above "
-            "(decision='failed')."
+            f"decision={ev['decision']:<10} status={ev['status']}{revision}"
         )
 
     console.rule("Replay")
@@ -171,9 +186,10 @@ def main() -> None:
 
     if not is_valid_pr_url(args.pr):
         console.print(f"[red]✗ Not a GitHub PR URL:[/red] {args.pr}")
-        raise SystemExit(2)
+        raise SystemExit(EXIT_BAD_INPUT)
 
-    asyncio.run(run(args.pr, args.thread, dry_run=args.dry_run))
+    result = asyncio.run(run(args.pr, args.thread, dry_run=args.dry_run))
+    raise SystemExit(report_exit(result))
 
 
 if __name__ == "__main__":

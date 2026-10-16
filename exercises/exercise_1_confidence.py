@@ -36,6 +36,7 @@ from common.schemas import (
     has_blocking_risk,
     route_for,
 )
+from exercises.cli import EXIT_BAD_INPUT, EXIT_FAILURE, report_exit
 
 force_utf8_stdio()
 console = Console()
@@ -170,27 +171,29 @@ def main() -> None:
         final = app.invoke({"pr_url": args.pr})
     except GitHubError as exc:
         console.print(f"[red]✗ GitHub error:[/red] {exc.friendly}")
-        raise SystemExit(1) from exc
+        raise SystemExit(EXIT_FAILURE) from exc
     except (RuntimeError, TypeError) as exc:
         console.print(f"[red]✗ {exc}[/red]")
         console.print(
-            "[dim]Nothing was posted. Check OPENROUTER_API_KEY / LLM_MODEL in .env, "
-            "and your OpenRouter credit balance.[/dim]"
+            "[dim]Nothing was posted. Check LLM_API_KEY (or OPENROUTER_API_KEY) / "
+            "LLM_MODEL / LLM_BASE_URL in .env.[/dim]"
         )
-        raise SystemExit(1) from exc
+        raise SystemExit(EXIT_FAILURE) from exc
     except ValueError as exc:
         console.print(f"[red]✗ {exc}[/red]")
-        raise SystemExit(2) from exc
+        raise SystemExit(EXIT_BAD_INPUT) from exc
 
     console.rule("Final")
     analysis = final.get("analysis")
     if analysis is None:
         console.print(f"[red]✗ run stopped early:[/red] {final.get('final_action')}")
         console.print("[red]Nothing was posted to GitHub.[/red]")
-        raise SystemExit(1)
+        raise SystemExit(EXIT_FAILURE)
     console.print(f"confidence = {analysis.confidence:.0%} (risk={audit_risk_level(analysis)})")
     console.print(f"decision   = {final.get('decision')}")
     console.print(f"action     = {final.get('final_action')}")
+    # This exercise routes only: every terminal state here is a designed outcome.
+    raise SystemExit(report_exit(final))
 
 
 if __name__ == "__main__":

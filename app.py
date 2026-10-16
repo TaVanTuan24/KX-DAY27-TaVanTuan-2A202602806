@@ -71,39 +71,100 @@ async def run_graph(
     thread_id: str,
     resume_value: Any = None,
     *,
-    dry_run: bool = False,
+    dry_run: bool | None = None,
     reviewer_id: str | None = None,
 ) -> dict:
     """Invoke the graph once; return the result (possibly holding ``__interrupt__``).
 
     A fresh checkpointer connection and event loop per call — see module docstring.
-    ``reviewer_id`` is injected into the graph state on the *start* call so the
-    HITL audit rows can attribute the decision to a GitHub username.
+
+    ``dry_run`` is only used when *starting* a session: it is written into the graph
+    state, which is then the single source of truth. The graph is always built with
+    ``dry_run=None`` so a resume cannot flip the mode, and a checkpoint that never
+    recorded one fails safe (no POST). See ``Agent.effective_dry_run``.
+
+    ``reviewer_id`` is likewise injected on the start call so HITL audit rows can
+    attribute the decision to a GitHub username.
     """
     async with open_checkpointer() as cp:
-        app = build_graph(
-            mode=Mode.EXERCISE_5, checkpointer=cp, dry_run=dry_run
-        )
+        app = build_graph(mode=Mode.EXERCISE_5, checkpointer=cp, dry_run=None)
         cfg = config_for(thread_id)
         if resume_value is None:
-            seed: dict[str, Any] = {"pr_url": pr_url, "thread_id": thread_id}
+            seed: dict[str, Any] = {
+                "pr_url": pr_url,
+                "thread_id": thread_id,
+                "dry_run": bool(dry_run),
+            }
             if reviewer_id:
                 seed["reviewer_id"] = reviewer_id
             return await app.ainvoke(seed, cfg)
         return await app.ainvoke(Command(resume=resume_value), cfg)
 
 
-async def load_pending(thread_id: str) -> dict | None:
-    """Return the interrupt payload a paused thread is waiting on, if any."""
+class SessionView:
+    """Read-only view of a thread reconstructed from its checkpoint.
+
+    Exactly one of ``pending`` / ``values`` is meaningful:
+
+    * ``pending`` — the graph is paused on an ``interrupt()``; ``values`` also holds
+      the state so far, and the card can be re-rendered to continue.
+    * ``values`` — the graph finished; this is its final state, rendered as history.
+    * neither — there is no checkpoint (e.g. it was deleted); the audit trail may
+      still describe the session.
+    """
+
+    def __init__(
+        self,
+        *,
+        pending: dict | None = None,
+        values: dict | None = None,
+        dry_run: bool | None = None,
+        revision: int | None = None,
+    ) -> None:
+        self.pending = pending
+        self.values = values
+        self.dry_run = dry_run
+        self.revision = revision
+
+    @property
+    def has_checkpoint(self) -> bool:
+        return bool(self.pending) or bool(self.values)
+
+    @property
+    def is_pending(self) -> bool:
+        return self.pending is not None
+
+    @property
+    def is_finished(self) -> bool:
+        return self.pending is None and bool(self.values)
+
+
+async def load_session(thread_id: str) -> SessionView:
+    """Reconstruct a session from its checkpoint — read-only, runs nothing.
+
+    Used both to recover a paused review and (FIX 6) to re-display a *finished*
+    one: opening either must not re-run the LLM, must not POST, and must not
+    modify the checkpoint.
+    """
     async with open_checkpointer() as cp:
         app = build_graph(mode=Mode.EXERCISE_5, checkpointer=cp)
         snapshot = await app.aget_state(config_for(thread_id))
-        if not snapshot.next:
-            return None
+        values = dict(snapshot.values or {})
+        pending: dict | None = None
         for task in snapshot.tasks or ():
             for intr in task.interrupts or ():
-                return getattr(intr, "value", intr)
-    return None
+                pending = getattr(intr, "value", intr)
+                break
+            if pending is not None:
+                break
+        if not snapshot.next:
+            pending = None
+        return SessionView(
+            pending=pending,
+            values=values,
+            dry_run=(values.get("dry_run") if "dry_run" in values else None),
+            revision=values.get("edit_revision"),
+        )
 
 
 def call_async(coro):
@@ -130,15 +191,52 @@ def init_state() -> None:
     st.session_state.setdefault("error", None)
     st.session_state.setdefault("reviewer_id", "")
     st.session_state.setdefault("dry_run", False)
+    #: The mode the *current* session was created with (None = no session yet).
+    st.session_state.setdefault("session_dry_run", None)
+    st.session_state.setdefault("session_finished", False)
+    st.session_state.setdefault("history_only", False)
+    st.session_state.setdefault("edit_mode", False)
 
 
 def reset_for(pr_url: str) -> None:
-    """Start a brand-new review thread (new thread_id, cleared UI state)."""
+    """Start a brand-new review thread (new thread_id, cleared UI state).
+
+    This is the ONLY place the dry-run of a session is chosen: it is persisted
+    into the graph state on the first invoke and locked afterwards.
+    """
     st.session_state.pr_url = pr_url
     st.session_state.thread_id = str(uuid.uuid4())
     st.session_state.interrupt_payload = None
     st.session_state.final = None
     st.session_state.error = None
+    st.session_state.edit_mode = False
+    st.session_state.session_finished = False
+    st.session_state.history_only = False
+    st.session_state.session_dry_run = bool(st.session_state.dry_run)
+
+
+def open_session(view: "SessionView", thread_id: str, pr_url: str) -> None:
+    """Adopt an existing thread in the UI (never writes to its checkpoint)."""
+    st.session_state.thread_id = thread_id
+    st.session_state.pr_url = pr_url
+    st.session_state.error = None
+    st.session_state.edit_mode = False
+    st.session_state.history_only = not view.has_checkpoint
+    st.session_state.session_finished = view.is_finished
+    if view.dry_run is not None:
+        # Restore the session's original mode; the toggle shows (and locks) it.
+        st.session_state.session_dry_run = bool(view.dry_run)
+        st.session_state.dry_run = bool(view.dry_run)
+    if view.is_pending:
+        st.session_state.interrupt_payload = view.pending
+        st.session_state.final = None
+    elif view.is_finished:
+        st.session_state.interrupt_payload = None
+        st.session_state.final = view.values
+    else:
+        # No checkpoint left: show what the audit trail knows, with a warning.
+        st.session_state.interrupt_payload = None
+        st.session_state.final = None
 
 
 def apply_result(result: dict) -> None:
@@ -148,9 +246,12 @@ def apply_result(result: dict) -> None:
     if payload is not None:
         st.session_state.interrupt_payload = payload
         st.session_state.final = None
+        st.session_state.session_finished = False
     else:
         st.session_state.interrupt_payload = None
         st.session_state.final = result
+        st.session_state.session_finished = True
+    st.session_state.edit_mode = False
 
 
 # ─── renderers (pure: display + return the resume value) ───────────────────
@@ -196,7 +297,100 @@ def render_approval_card(payload: dict) -> dict | None:
     if col2.button("⛔ Reject", use_container_width=True):
         return {"choice": "reject", "feedback": feedback}
     if col3.button("✏️ Edit", use_container_width=True):
-        return {"choice": "edit", "feedback": feedback}
+        # Open the edit form instead of resuming straight away: an Edit needs
+        # instructions (or a replacement review) before it is actionable.
+        st.session_state.edit_mode = True
+        st.rerun()
+
+    if st.session_state.get("edit_mode"):
+        st.markdown("### ✏️ Edit this review")
+        st.caption(
+            "Describe what to change and the agent revises the review, or paste the "
+            "review you want posted — replacement text is used verbatim and is never "
+            "rewritten by the model. Blocker findings are kept either way."
+        )
+        instructions = st.text_area(
+            "Edit instructions (applied by the agent)",
+            key="edit_instructions_input",
+            height=80,
+            placeholder="e.g. drop the ordering nit, keep the migration blocker",
+        )
+        replacement = st.text_area(
+            "Replacement review text (optional — posted verbatim, overwrites the above)",
+            key="edit_body_input",
+            height=160,
+            placeholder="Leave empty to let the agent revise it from your instructions.",
+        )
+        c1, c2 = st.columns(2)
+        if c1.button("▶️ Apply edit", type="primary", use_container_width=True):
+            if not instructions.strip() and not replacement.strip():
+                st.warning("Enter instructions or paste a replacement review.")
+            else:
+                return {
+                    "choice": "edit",
+                    "feedback": instructions,
+                    "edited_body": replacement.strip() or None,
+                }
+        if c2.button("Cancel edit", use_container_width=True):
+            st.session_state.edit_mode = False
+            st.rerun()
+    return None
+
+
+def render_edited_review_card(payload: dict) -> dict | None:
+    """Post-Edit gate: preview the revised review, then confirm / edit again / reject.
+
+    Nothing has been posted at this point; the reviewer must confirm.
+    """
+    revision = payload.get("revision") or 1
+    conf = float(payload.get("confidence", 0.0))
+    st.subheader(f"✏️ Edited review — revision {revision} (confidence {conf:.0%})")
+    st.caption(payload.get("confidence_reasoning", ""))
+    if payload.get("risk_factors"):
+        for rf in payload["risk_factors"]:
+            st.markdown(f"- ⚠️ {rf}")
+    st.markdown(payload.get("summary", ""))
+    for c in payload.get("comments") or []:
+        st.markdown(
+            f"- **[{c['severity']}]** `{c['file']}:{c.get('line') or '?'}` — {c['body']}"
+        )
+
+    st.markdown("**Preview of the comment that would be posted**")
+    st.code(payload.get("proposed_body") or "(empty)", language="markdown")
+    st.info("Nothing has been posted to GitHub yet.")
+
+    col1, col2, col3 = st.columns(3)
+    if col1.button("📮 Confirm & post", type="primary", use_container_width=True):
+        return {"confirm": True, "feedback": st.session_state.get("edit_review_feedback", "")}
+    if col2.button("✏️ Edit again", use_container_width=True):
+        st.session_state.edit_mode = True
+        st.rerun()
+    if col3.button("⛔ Cancel / reject", use_container_width=True):
+        return {"confirm": False, "feedback": st.session_state.get("edit_review_feedback", "")}
+
+    if st.session_state.get("edit_mode"):
+        st.markdown("### ✏️ Another revision")
+        instructions = st.text_area(
+            "Further edit instructions", key="edit_again_instructions", height=80
+        )
+        replacement = st.text_area(
+            "Replacement review text (optional — posted verbatim)",
+            key="edit_again_body",
+            height=140,
+        )
+        c1, c2 = st.columns(2)
+        if c1.button("▶️ Apply another revision", type="primary", use_container_width=True):
+            if not instructions.strip() and not replacement.strip():
+                st.warning("Enter instructions or paste a replacement review.")
+            else:
+                return {
+                    "choice": "edit",
+                    "feedback": instructions,
+                    "edited_body": replacement.strip() or None,
+                }
+        if c2.button("Back", use_container_width=True):
+            st.session_state.edit_mode = False
+            st.rerun()
     return None
 
 
@@ -263,6 +457,8 @@ def render_interrupt(payload: dict) -> dict | None:
         return render_escalation_card(payload)
     if kind == "final_confirmation":
         return render_final_confirmation_card(payload)
+    if kind == "edited_review":
+        return render_edited_review_card(payload)
     st.error(f"Unknown interrupt kind: {kind!r}")
     return None
 
@@ -277,18 +473,40 @@ def render_final(final: dict, pr_url: str, thread_id: str) -> None:
     if action in {"committed", "auto_approved"}:
         st.success(f"Comment posted to GitHub — {action}")
         st.markdown(f"[View the pull request on GitHub]({pr_url})")
+    elif action == "committed_already":
+        st.success(
+            "The review was already on the PR from an earlier attempt — it was "
+            "**not** posted a second time."
+        )
+        st.markdown(f"[View the pull request on GitHub]({pr_url})")
     elif action in {"committed_dry_run", "auto_approved_dry_run"}:
         st.warning("Dry-run: the review is ready but was NOT posted to GitHub.")
         with st.expander("Comment body that would be posted", expanded=False):
             st.markdown(final.get("posted_comment_body") or "(empty)")
+    elif action == "commit_unconfirmed":
+        st.error(
+            "GitHub accepted the request but the outcome could **not** be confirmed — "
+            "the comment may or may not exist, and it was deliberately NOT retried. "
+            f"Check the PR before doing anything else. ({final.get('post_error')})"
+        )
     elif action == "rejected":
         st.warning("Rejected — nothing was posted to GitHub.")
     elif action in {"commit_failed", "auto_approve_failed"}:
         st.error(f"GitHub rejected the comment: {final.get('post_error')}")
+    elif action == "auto_refused_security":
+        st.error(
+            "Refused to auto-post: a security or blocker finding is present, so this "
+            "needs a human."
+        )
     elif action in {"fetch_failed", "analyze_failed"}:
         st.error(f"The run stopped early ({action}). Nothing was posted.")
     else:
         st.info(f"final_action = {action}")
+    if final.get("audit_error"):
+        st.warning(
+            "The audit trail is incomplete for this run "
+            f"({final['audit_error']}) — automation should not treat it as verified."
+        )
     if analysis is not None:
         st.markdown("**Summary**")
         st.markdown(analysis.summary)
@@ -322,6 +540,7 @@ def render_events(thread_id: str) -> None:
                     "risk": e["risk_level"],
                     "decision": e["decision"],
                     "status": e["status"],
+                    "rev": e.get("revision", 0),
                     "reviewer": e["reviewer_id"] or "-",
                     "ms": e["execution_time_ms"],
                 }
@@ -350,8 +569,17 @@ def _sidebar_recent_sessions() -> None:
         label = STATUS_LABEL.get(row["last_action"] or "", row["last_action"] or "?")
         risk = row["worst_risk"] or "?"
         marker = {"high": "🔴", "med": "🟡", "low": "🟢"}.get(risk, "⚪")
+        mode = (
+            " · dry-run"
+            if row["last_decision"] == "dry_run"
+            else " · posted"
+            if row["last_decision"] in {"committed", "auto"}
+            else ""
+        )
         is_current = tid == st.session_state.get("thread_id")
-        header = f"{marker} **{'→ ' if is_current else ''}{tid[:8]}** · {label} · {risk}"
+        header = (
+            f"{marker} **{'→ ' if is_current else ''}{tid[:8]}** · {label} · {risk}{mode}"
+        )
         with st.expander(header, expanded=is_current):
             st.caption(f"PR: {row['pr_url']}")
             st.caption(
@@ -359,14 +587,14 @@ def _sidebar_recent_sessions() -> None:
                 f"decision: {row['last_decision']}"
             )
             if st.button("Open this session", key=f"open_{tid}"):
-                st.session_state.thread_id = tid
-                st.session_state.pr_url = row["pr_url"]
-                st.session_state.final = None
-                st.session_state.error = None
+                # Read-only: rebuild the view from the checkpoint. Opening a session
+                # never runs the graph, never posts, and never touches the
+                # checkpoint — whether it is paused or already finished (FIX 6).
                 try:
-                    st.session_state.interrupt_payload = asyncio.run(load_pending(tid))
+                    view = asyncio.run(load_session(tid))
+                    open_session(view, tid, row["pr_url"])
                 except Exception as exc:  # pragma: no cover - defensive
-                    st.session_state.interrupt_payload = None
+                    open_session(SessionView(), tid, row["pr_url"])
                     st.session_state.error = f"Could not read the checkpoint: {exc}"
                 st.rerun()
 
@@ -382,12 +610,31 @@ def main() -> None:
             value=st.session_state.reviewer_id,
             placeholder="tavan",
         )
+        # FIX 2: the dry-run mode belongs to the SESSION, not to the widget. It is
+        # chosen when a review starts, persisted in the graph state, and locked
+        # afterwards so flipping the toggle mid-session cannot turn a rehearsal
+        # into a real comment.
+        session_active = bool(st.session_state.thread_id)
         st.session_state.dry_run = st.toggle(
             "Dry-run (never POST to GitHub)",
-            value=st.session_state.dry_run,
-            help="Runs the whole graph and writes the audit trail, but skips the "
-            "GitHub comment call.",
+            value=(
+                st.session_state.session_dry_run
+                if session_active and st.session_state.session_dry_run is not None
+                else st.session_state.dry_run
+            ),
+            disabled=session_active,
+            help=(
+                "Locked for this session: the mode is fixed when a review starts so a "
+                "resume cannot turn a dry-run into a real post. Start a new review to "
+                "change it."
+                if session_active
+                else "Runs the whole graph and writes the audit trail, but skips the "
+                "GitHub comment call."
+            ),
         )
+        if session_active:
+            original = "dry-run" if st.session_state.session_dry_run else "live (may POST)"
+            st.caption(f"Session mode: **{original}** (locked)")
         st.divider()
         _sidebar_recent_sessions()
 
@@ -442,19 +689,21 @@ def main() -> None:
             kind = payload.get("kind")
             if kind == "escalation" and not any(answer.values()):
                 st.warning("Please answer at least one question before submitting.")
-            elif kind == "approval_request" and answer["choice"] == "edit" and not answer[
-                "feedback"
-            ].strip():
+            elif kind == "approval_request" and answer.get("choice") == "edit" and not (
+                (answer.get("feedback") or "").strip()
+                or (answer.get("edited_body") or "").strip()
+            ):
                 st.warning("Edit selected — describe what to change, or choose Approve.")
             else:
                 with st.spinner("Resuming the graph…"):
                     try:
+                        # No `dry_run` here on purpose: the mode was persisted when
+                        # the session started and the state is authoritative.
                         result = call_async(
                             run_graph(
                                 st.session_state.pr_url,
                                 st.session_state.thread_id,
                                 answer,
-                                dry_run=st.session_state.dry_run,
                             )
                         )
                         apply_result(result)
@@ -470,9 +719,26 @@ def main() -> None:
     if final is not None:
         st.divider()
         thread_id = st.session_state.thread_id or ""
+        if st.session_state.get("session_finished"):
+            st.caption(
+                "Session history (read-only — opening a session never re-runs the "
+                "agent or posts anything)."
+            )
+        if st.session_state.get("history_only"):
+            st.warning(
+                "No checkpoint is available for this thread any more, so only the "
+                "audit trail below can be shown."
+            )
         render_final(final, st.session_state.pr_url, thread_id)
         if thread_id:
             render_events(thread_id)
+    elif st.session_state.get("history_only") and st.session_state.get("thread_id"):
+        st.divider()
+        st.warning(
+            "No checkpoint is available for this thread any more, so only the audit "
+            "trail can be shown."
+        )
+        render_events(st.session_state.thread_id)
 
     if st.session_state.get("error") and final is None:
         st.error(st.session_state.error)

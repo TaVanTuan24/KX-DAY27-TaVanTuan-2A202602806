@@ -56,36 +56,66 @@ async def _ensure_schema(conn: aiosqlite.Connection) -> None:
 #: `decision` participates in the key so that a *different* outcome (e.g. the
 #: reviewer first approves, then rejects on a re-run) is still recorded, while an
 #: identical repeat is dropped.
-IDEMPOTENCY_COLUMNS = ("thread_id", "action", "status", "decision")
+#:
+#: `revision` participates so a *new Edit round* in the same thread is recorded:
+#: without it, a second `human_approval`/`responded`/`edit` event would look like
+#: a duplicate of the first and be dropped, losing a real human decision.
+IDEMPOTENCY_COLUMNS = ("thread_id", "action", "status", "decision", "revision")
+
+#: Columns that older databases may be missing, with the DDL to add them.
+_MIGRATABLE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("status", "ALTER TABLE audit_events ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"),
+    ("revision", "ALTER TABLE audit_events ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"),
+)
 
 
 async def _ensure_idempotency_index(conn: aiosqlite.Connection) -> None:
     """Create the UNIQUE idempotency index, migrating pre-existing databases.
 
-    A database created before this index existed can already contain duplicate
-    rows (the very bug the index prevents). SQLite refuses to create a UNIQUE
-    index over duplicates, so we first collapse each duplicate group to its
-    earliest row, then create the index.
-    """
-    async with conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='index' "
-        "AND name='audit_events_idempotency_idx'"
-    ) as cur:
-        if await cur.fetchone() is not None:
-            return
+    Handles three generations of `audit_events`:
 
-    # Older schema: `decision` played the role of today's `status` column.
+    1. the original schema (no ``status``, no ``revision``, no unique index);
+    2. the schema with ``status`` but a 4-column index;
+    3. the current 5-column index.
+
+    A database created before an index existed can already contain duplicate rows
+    (the very bug the index prevents). SQLite refuses to create a UNIQUE index over
+    duplicates, so each duplicate group is first collapsed to its earliest row.
+
+    Valid audit history is never deleted: only *exact* duplicates of the current
+    key are collapsed, and the columns that distinguish a new Edit round
+    (``revision``) are added before that comparison.
+    """
     async with conn.execute("PRAGMA table_info(audit_events)") as cur:
         columns = {row[1] for row in await cur.fetchall()}
+
+    for name, ddl in _MIGRATABLE_COLUMNS:
+        if name not in columns:
+            await conn.execute(ddl)
+            await conn.commit()
+            logger.info("audit_events: added `%s` column (schema migration)", name)
+
     if "status" not in columns:
-        await conn.execute(
-            "ALTER TABLE audit_events ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
-        )
+        # Generation 1: `decision` played the role of today's `status`.
         await conn.execute("UPDATE audit_events SET status = decision WHERE status = 'pending'")
         await conn.commit()
-        logger.info("audit_events: added `status` column (schema migration)")
+
+    async with conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='audit_events_idempotency_idx'"
+    ) as cur:
+        row = await cur.fetchone()
 
     cols = ", ".join(IDEMPOTENCY_COLUMNS)
+    if row is not None:
+        existing = (row["sql"] or "") if isinstance(row, aiosqlite.Row) else row[0] or ""
+        if all(column in existing for column in IDEMPOTENCY_COLUMNS):
+            return  # already current
+        # Wider key than before (e.g. missing `revision`) → rebuild it.
+        await conn.execute("DROP INDEX IF EXISTS audit_events_idempotency_idx")
+        await conn.commit()
+        logger.info("audit_events: rebuilding the idempotency index on (%s)", cols)
+
     await conn.execute(
         f"""
         DELETE FROM audit_events
@@ -124,36 +154,42 @@ async def write_audit_event(
     thread_id: str,
     pr_url: str,
     entry: AuditEntry,
-) -> None:
-    """Append one structured audit row — idempotent per (thread, action, status).
+) -> bool:
+    """Append one structured audit row — idempotent per idempotency key.
 
     `thread_id` and `pr_url` are session-context columns (used for grouping
     and filtering); all other fields come from the `AuditEntry` so they map
     1-to-1 with first-class SQL columns.
 
-    The second and later calls for the same (thread_id, action, status) are
-    silently ignored (``INSERT OR IGNORE``), which is what keeps the audit trail
-    free of duplicates when a node containing ``interrupt()`` is re-executed
-    after the graph resumes.
+    The second and later calls with an *identical* key — (thread_id, action,
+    status, decision, revision) — are ignored (``INSERT OR IGNORE``), which keeps
+    the audit trail free of duplicates when a node containing ``interrupt()`` is
+    re-executed after the graph resumes. A genuinely new Edit round carries a new
+    ``revision``, so it is recorded instead of being mistaken for a duplicate.
+
+    Returns True when the row was written, False when it was an ignored duplicate.
     """
     async with db_conn() as conn:
-        await conn.execute(
+        cur = await conn.execute(
             """
             INSERT OR IGNORE INTO audit_events (
                 timestamp, thread_id, pr_url,
                 agent_id, action, confidence, risk_level,
-                reviewer_id, decision, status, reason, execution_time_ms
+                reviewer_id, decision, status, revision, reason, execution_time_ms
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entry.timestamp.isoformat(), thread_id, pr_url,
                 entry.agent_id, entry.action, entry.confidence, entry.risk_level,
-                entry.reviewer_id, entry.decision, entry.status,
+                entry.reviewer_id, entry.decision, entry.status, entry.revision,
                 entry.reason, entry.execution_time_ms,
             ),
         )
+        written = cur.rowcount > 0
+        await cur.close()
         await conn.commit()
+    return written
 
 
 async def replay_events(thread_id: str) -> list[dict[str, Any]]:
@@ -162,7 +198,7 @@ async def replay_events(thread_id: str) -> list[dict[str, Any]]:
         async with conn.execute(
             """
             SELECT id, timestamp, agent_id, action, confidence, risk_level,
-                   reviewer_id, decision, status, reason, execution_time_ms
+                   reviewer_id, decision, status, revision, reason, execution_time_ms
               FROM audit_events
              WHERE thread_id = ?
              ORDER BY id

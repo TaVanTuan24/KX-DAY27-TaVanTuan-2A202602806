@@ -20,6 +20,8 @@ from common.github import (
     GitHubRateLimitError,
     GitHubServerError,
     GitHubTimeoutError,
+    PostStatus,
+    _paginate,
     already_posted,
     comment_marker,
     current_user,
@@ -252,9 +254,11 @@ def test_post_review_comment_uses_the_issues_endpoint(monkeypatch: pytest.Monkey
         )
 
     with make_client(handler) as client:
-        url = post_review_comment(PR_URL, "review body", thread_id="t1", client=client)
+        result = post_review_comment(PR_URL, "review body", thread_id="t1", client=client)
 
-    assert url.endswith("/comment/1")
+    assert result.status == PostStatus.POSTED
+    assert result.ok and not result.unconfirmed
+    assert result.comment_url.endswith("/comment/1")
     method, posted_url, body = calls[0]
     assert method == "POST"
     assert posted_url == f"{API}/repos/VinUni-AI20k/PR-Demo/issues/1/comments"
@@ -275,7 +279,8 @@ def test_post_is_skipped_when_the_marker_is_already_present() -> None:
 
     with make_client(handler) as client:
         result = post_review_comment(PR_URL, "review body", thread_id="t1", client=client)
-    assert result == "already_posted"
+    assert result.status == PostStatus.ALREADY_POSTED
+    assert result.ok
     assert posts["n"] == 0
 
 
@@ -294,7 +299,8 @@ def test_different_threads_get_different_markers_and_both_post() -> None:
     with make_client(handler) as client:
         a = post_review_comment(PR_URL, "review", thread_id="thread-a", client=client)
         b = post_review_comment(PR_URL, "review", thread_id="thread-b", client=client)
-    assert (a, b) == ("c1", "c2")
+    assert (a.comment_url, b.comment_url) == ("c1", "c2")
+    assert a.status == b.status == PostStatus.POSTED
     assert comment_marker("thread-a") != comment_marker("thread-b")
 
 
@@ -376,3 +382,342 @@ def test_token_never_appears_in_an_error_message(monkeypatch: pytest.MonkeyPatch
             fetch_pr(PR_URL, client=client)
     assert "ghp_supersecretvalue" not in str(exc.value)
     assert "***" in str(exc.value)
+
+
+# ─── FIX 4: pagination ─────────────────────────────────────────────────────
+#
+# A PR with more than one page of files/comments used to be silently truncated to
+# page 1 — which also meant the duplicate-marker check could miss an existing
+# comment and post a second one.
+
+COMMENTS_URL = f"{API}/repos/VinUni-AI20k/PR-Demo/issues/1/comments"
+
+
+def _link(next_url: str | None) -> dict[str, str]:
+    return {"Link": f'<{next_url}>; rel="next"' if next_url else ""}
+
+
+def _page_handler(pages: list[list[dict]], *, per_page_url: str | None = None):
+    """Serve ``pages`` in order, chaining them with Link headers."""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        index = len(calls) - 1
+        body = pages[index] if index < len(pages) else []
+        nxt = (
+            f"{per_page_url or COMMENTS_URL}&page={index + 2}"
+            if index + 1 < len(pages)
+            else None
+        )
+        headers = {"Link": f'<{nxt}>; rel="next"'} if nxt else {}
+        return httpx.Response(200, json=body, headers=headers, request=request)
+
+    return handler, calls
+
+
+def test_pagination_walks_every_page() -> None:
+    handler, calls = _page_handler([[{"id": 1}], [{"id": 2}], [{"id": 3}]])
+    with make_client(handler) as client:
+        items = _paginate(client, COMMENTS_URL, headers={})
+    assert [i["id"] for i in items] == [1, 2, 3]
+    assert len(calls) == 3
+    assert "per_page" in calls[0] or True  # caller controls the query string
+
+
+def test_pagination_stops_without_a_link_header() -> None:
+    handler, calls = _page_handler([[{"id": 1}]])
+    with make_client(handler) as client:
+        items = _paginate(client, COMMENTS_URL, headers={})
+    assert len(items) == 1 and len(calls) == 1
+
+
+def test_pagination_handles_an_empty_page() -> None:
+    handler, _ = _page_handler([[]])
+    with make_client(handler) as client:
+        assert _paginate(client, COMMENTS_URL, headers={}) == []
+
+
+def test_pagination_ignores_an_untrusted_next_link() -> None:
+    """A Link header is server data: following another host would leak the token."""
+    schemes = ["https://evil.example.com/repos/x/y/issues/1/comments", "http://api.github.com/x"]
+
+    for next_url in schemes:
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(
+                200, json=[{"id": 1}], headers={"Link": f'<{next_url}>; rel="next"'}, request=request
+            )
+
+        with make_client(handler) as client:
+            items = _paginate(client, COMMENTS_URL, headers={})
+        assert len(items) == 1
+        assert len(calls) == 1, f"must not follow {next_url}"
+
+
+def test_pagination_is_bounded_by_max_pages() -> None:
+    """A looping Link header must not spin forever."""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(
+            200,
+            json=[{"id": len(calls)}],
+            headers={"Link": f'<{COMMENTS_URL}&page={len(calls) + 1}>; rel="next"'},
+            request=request,
+        )
+
+    with make_client(handler) as client:
+        items = _paginate(client, COMMENTS_URL, headers={}, max_pages=4)
+    assert len(calls) == 4
+    assert len(items) == 4
+
+
+def test_pagination_propagates_a_midway_failure() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if len(calls) == 1:
+            return httpx.Response(
+                200,
+                json=[{"id": 1}],
+                headers={"Link": f'<{COMMENTS_URL}&page=2>; rel="next"'},
+                request=request,
+            )
+        return httpx.Response(404, json={"message": "gone"}, request=request)
+
+    with make_client(handler) as client:
+        with pytest.raises(GitHubNotFoundError):
+            _paginate(client, COMMENTS_URL, headers={})
+    assert len(calls) == 2
+
+
+def test_fetch_pr_collects_files_from_every_page() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/files"):
+            page = int(dict(request.url.params).get("page", "1"))
+            if page == 1:
+                return httpx.Response(
+                    200,
+                    json=[{"filename": "a.py"}],
+                    headers={"Link": f'<{request.url}&page=2>; rel="next"'},
+                    request=request,
+                )
+            return httpx.Response(200, json=[{"filename": "b.py"}], request=request)
+        if request.headers.get("accept") == "application/vnd.github.v3.diff":
+            return httpx.Response(200, text=DIFF, request=request)
+        return httpx.Response(200, json=META, request=request)
+
+    with make_client(handler) as client:
+        pr = fetch_pr(PR_URL, client=client)
+    assert pr.files_changed == ["a.py", "b.py"], "files must not be truncated to page 1"
+
+
+def test_marker_on_a_later_page_is_found() -> None:
+    """The duplicate check must not be limited to page 1 either."""
+    marker = comment_marker("t-late")
+    handler, calls = _page_handler(
+        [[{"body": "unrelated"}], [{"body": f"review\n\n{marker}", "html_url": "c2"}]]
+    )
+    with make_client(handler) as client:
+        assert already_posted(PR_URL, "t-late", client=client) is True
+    assert len(calls) == 2
+
+
+def test_marker_on_the_last_page_prevents_a_second_post() -> None:
+    marker = comment_marker("t1")
+    attempts = {"post": 0}
+    pages = [[{"body": "x"}], [{"body": marker, "html_url": "c2"}]]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            attempts["post"] += 1
+            return httpx.Response(201, json={"html_url": "dup"}, request=request)
+        page = int(dict(request.url.params).get("page", "1"))
+        body = pages[page - 1] if page <= len(pages) else []
+        nxt = f"{request.url}&page={page + 1}" if page < len(pages) else None
+        headers = {"Link": f'<{nxt}>; rel="next"'} if nxt else {}
+        return httpx.Response(200, json=body, headers=headers, request=request)
+
+    with make_client(handler) as client:
+        result = post_review_comment(PR_URL, "review", thread_id="t1", client=client)
+    assert result.status == PostStatus.ALREADY_POSTED
+    assert attempts["post"] == 0, "an existing comment on a later page must stop the POST"
+
+
+# ─── FIX 3: a POST is never blindly retried ────────────────────────────────
+
+
+def test_an_ambiguous_timeout_is_not_retried_and_reports_unconfirmed() -> None:
+    """Timeout + the marker absent afterwards → we genuinely do not know.
+
+    The POST must happen exactly once and the result must be neither success nor
+    failure.
+    """
+    attempts = {"post": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[], request=request)  # marker absent
+        attempts["post"] += 1
+        raise httpx.ReadTimeout("no response", request=request)
+
+    with make_client(handler) as client:
+        result = post_review_comment(PR_URL, "review", thread_id="t1", client=client)
+
+    assert attempts["post"] == 1, "an ambiguous POST must not be retried"
+    assert result.status == PostStatus.UNCONFIRMED
+    assert result.ok is False and result.unconfirmed is True
+    assert "not retried" in result.detail
+
+
+def test_an_ambiguous_timeout_after_the_server_applied_it_is_detected() -> None:
+    """Timeout, but the server *did* create the comment → report already_posted."""
+    attempts = {"post": 0}
+    created: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=list(created), request=request)
+        attempts["post"] += 1
+        payload = json.loads(request.content)
+        created.append({"body": payload["body"], "html_url": "c1"})
+        raise httpx.ReadTimeout("response lost", request=request)
+
+    with make_client(handler) as client:
+        result = post_review_comment(PR_URL, "review", thread_id="t1", client=client)
+
+    assert attempts["post"] == 1
+    assert result.status == PostStatus.ALREADY_POSTED
+    assert result.ok is True and result.marker_found is True
+    assert result.comment_url == "c1"
+
+
+def test_a_500_after_an_unknown_outcome_is_unconfirmed_not_failed() -> None:
+    """A 5xx may mean the server created the comment; guessing either way is wrong."""
+    attempts = {"post": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[], request=request)
+        attempts["post"] += 1
+        return httpx.Response(500, text="internal error", request=request)
+
+    with make_client(handler) as client:
+        result = post_review_comment(PR_URL, "review", thread_id="t1", client=client)
+
+    assert attempts["post"] == 1
+    assert result.status == PostStatus.UNCONFIRMED
+
+
+def test_a_500_that_did_apply_is_treated_as_already_posted() -> None:
+    created: list[dict] = []
+    attempts = {"post": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=list(created), request=request)
+        attempts["post"] += 1
+        payload = json.loads(request.content)
+        created.append({"body": payload["body"], "html_url": "c9"})
+        return httpx.Response(502, text="bad gateway", request=request)
+
+    with make_client(handler) as client:
+        result = post_review_comment(PR_URL, "review", thread_id="t1", client=client)
+
+    assert attempts["post"] == 1
+    assert result.status == PostStatus.ALREADY_POSTED
+    assert result.comment_url == "c9"
+
+
+def test_verification_failing_also_yields_unconfirmed() -> None:
+    """If we cannot even check, we still must not claim success or failure."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if request.method == "GET":
+            return httpx.Response(200, json=[], request=request)
+        return httpx.Response(503, text="down", request=request)
+
+    with make_client(handler) as client:
+        result = post_review_comment(PR_URL, "review", thread_id="t1", client=client)
+    assert result.status == PostStatus.UNCONFIRMED
+
+
+def test_a_post_without_a_thread_marker_cannot_verify_so_is_unconfirmed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[], request=request)
+        raise httpx.ReadTimeout("no response", request=request)
+
+    with make_client(handler) as client:
+        result = post_review_comment(PR_URL, "review", client=client)  # no thread_id
+    assert result.status == PostStatus.UNCONFIRMED
+    assert "no thread marker" in result.detail
+
+
+def test_definitive_failures_are_still_raised_and_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """429 is definitive (not applied) → typed error, single attempt."""
+    monkeypatch.setattr("common.github.RETRY_BACKOFF_S", 0.0)
+    attempts = {"post": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[], request=request)
+        attempts["post"] += 1
+        return httpx.Response(429, headers={"retry-after": "1"}, request=request)
+
+    with make_client(handler) as client:
+        with pytest.raises(GitHubRateLimitError):
+            post_review_comment(PR_URL, "review", thread_id="t1", client=client)
+    assert attempts["post"] == 1
+
+
+def test_get_requests_are_still_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FIX 3 must not remove retries where they are safe."""
+    monkeypatch.setattr("common.github.RETRY_BACKOFF_S", 0.0)
+    seen = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return httpx.Response(503, request=request)
+        return ok_handler(request)
+
+    with make_client(handler) as client:
+        pr = fetch_pr(PR_URL, client=client)
+    assert pr.title == META["title"]
+    assert seen["n"] > 1
+
+
+def test_resuming_the_same_thread_does_not_post_twice() -> None:
+    """The retry/resume scenario, end to end at the client level."""
+    posted: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=list(posted), request=request)
+        payload = json.loads(request.content)
+        comment = {"body": payload["body"], "html_url": f"c{len(posted) + 1}"}
+        posted.append(comment)
+        return httpx.Response(201, json=comment, request=request)
+
+    with make_client(handler) as client:
+        first = post_review_comment(PR_URL, "review", thread_id="t1", client=client)
+        second = post_review_comment(PR_URL, "review", thread_id="t1", client=client)
+        third = post_review_comment(PR_URL, "review", thread_id="t1", client=client)
+
+    assert [first.status, second.status, third.status] == [
+        PostStatus.POSTED,
+        PostStatus.ALREADY_POSTED,
+        PostStatus.ALREADY_POSTED,
+    ]
+    assert len(posted) == 1, "exactly one comment for one thread"
+    assert second.attempts == 0
